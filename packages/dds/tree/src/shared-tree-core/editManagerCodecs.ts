@@ -59,6 +59,7 @@ export function clientVersionToEditManagerFormatVersion(
 			[lowestMinVersionForCollab]: EditManagerFormatVersion.v3,
 			[FluidClientVersion.v2_43]: EditManagerFormatVersion.v4,
 			[FluidClientVersion.v2_80]: EditManagerFormatVersion.v6,
+			[FluidClientVersion.v2_90]: EditManagerFormatVersion.v7,
 		}),
 	);
 
@@ -141,7 +142,8 @@ export function makeEditManagerCodecs<TChangeset>(
 			}
 			case unbrand(EditManagerFormatVersion.v3):
 			case unbrand(EditManagerFormatVersion.v4):
-			case unbrand(EditManagerFormatVersion.v6): {
+			case unbrand(EditManagerFormatVersion.v6):
+			case unbrand(EditManagerFormatVersion.v7): {
 				const changeCodec = changeCodecs.resolve(dependentChangeFormatVersion.lookup(version));
 				return [
 					version,

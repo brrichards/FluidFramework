@@ -11,7 +11,9 @@ import type {
 } from "@fluidframework/core-interfaces/internal";
 import { assert, unreachableCase } from "@fluidframework/core-utils/internal";
 import { UsageError } from "@fluidframework/telemetry-utils/internal";
+import { lt } from "semver-ts";
 
+import { FluidClientVersion } from "../codec/index.js";
 import { anchorSlot, rootFieldKey } from "../core/index.js";
 import {
 	type NodeIdentifierManager,
@@ -123,6 +125,12 @@ export class SchematizingSimpleTreeView<
 	 * which are implementation details and should not be exposed to the user.
 	 */
 	private midUpgrade = false;
+
+	/**
+	 * When set, an upgrade transaction is open and waiting for the first edit to commit.
+	 * Call this function to cancel the deferred upgrade and abort the transaction.
+	 */
+	private deferredUpgradeCleanup?: () => void;
 
 	/**
 	 * Hydration work deferred until Context has been created.
@@ -265,6 +273,93 @@ export class SchematizingSimpleTreeView<
 
 		const newSchema = toUpgradeSchema(this.viewSchema.viewSchema.root);
 		this.runSchemaEdit(() => this.checkout.updateSchema(newSchema));
+	}
+
+	/**
+	 * Upgrades the document schema to match the view schema, but defers sending the
+	 * schema change op until the first edit is made. This opens a transaction, applies
+	 * the schema upgrade inside it, and commits on the first subsequent edit — producing
+	 * a bundled op (schema + data) via the transaction squash.
+	 *
+	 * If no edit is ever made, the transaction is rolled back on disposal and no op is sent.
+	 *
+	 * @remarks Read-only clients that never edit will never cause a schema op to be sent.
+	 */
+	public upgradeSchemaOnNextEdit(): void {
+		this.ensureUndisposed();
+
+		if (this.deferredUpgradeCleanup !== undefined) {
+			// Already in deferred upgrade mode
+			return;
+		}
+
+		const compatibility = this.compatibility;
+		if (compatibility.isEquivalent) {
+			return;
+		}
+		if (!compatibility.canUpgrade) {
+			throw new UsageError(
+				"Existing stored schema cannot be upgraded (see TreeView.compatibility.canUpgrade).",
+			);
+		}
+
+		if (lt(this.checkout.minVersionForCollab, FluidClientVersion.v2_90)) {
+			throw new UsageError(
+				`upgradeSchemaOnNextEdit() requires minVersionForCollab of at least ${FluidClientVersion.v2_90}. ` +
+					"Use upgradeSchema() instead, or set minVersionForCollab to 2.90.0 or higher.",
+			);
+		}
+
+		// Listen for the next edit (afterBatch) to commit the transaction.
+		// The schema upgrade triggers afterBatch synchronously during runSchemaEdit(),
+		// so we register the listener first and skip that initial firing.
+		let committed = false;
+		let skipFirst = true;
+
+		const commitOnNextEdit = (): void => {
+			if (committed) {
+				return;
+			}
+			committed = true;
+			cleanup();
+			this.checkout.transaction.commit();
+		};
+
+		const abortUpgrade = (): void => {
+			if (committed) {
+				return;
+			}
+			committed = true;
+			cleanup();
+			this.checkout.transaction.abort();
+		};
+
+		const unregisterAfterBatch = this.checkout.events.on("afterBatch", () => {
+			if (skipFirst) {
+				skipFirst = false;
+				return;
+			}
+			commitOnNextEdit();
+		});
+
+		const cleanup = (): void => {
+			unregisterAfterBatch();
+			this.deferredUpgradeCleanup = undefined;
+		};
+
+		this.deferredUpgradeCleanup = abortUpgrade;
+
+		// Start a transaction and apply the schema upgrade inside it.
+		// The transaction stays open until the first edit, producing a bundled op.
+		this.checkout.transaction.start();
+		this.runSchemaEdit(() => {
+			const newSchema = toUpgradeSchema(this.viewSchema.viewSchema.root);
+			this.checkout.editor.schema.setStoredSchema(
+				this.checkout.storedSchema.clone(),
+				newSchema,
+				{ upgradeBundle: true },
+			);
+		});
 	}
 
 	/**
@@ -527,6 +622,8 @@ export class SchematizingSimpleTreeView<
 
 	public dispose(): void {
 		this.disposed = true;
+		// Abort any pending deferred upgrade transaction before disposal
+		this.deferredUpgradeCleanup?.();
 		this.disposeFlexView();
 		for (const unregister of this.unregisterCallbacks) {
 			unregister();

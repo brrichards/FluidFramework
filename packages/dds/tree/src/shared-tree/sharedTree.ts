@@ -320,6 +320,7 @@ export class SharedTreeKernel
 			logger,
 			breaker: this.breaker,
 			disposeForksAfterTransaction: options.disposeForksAfterTransaction,
+			codecOptions: { minVersionForCollab: options.minVersionForCollab },
 		});
 
 		this.registerSharedBranchForEditing("main", this.checkout);
@@ -556,6 +557,7 @@ export const changeFormatVersionForEditManager = DependentFormatVersion.fromPair
 	[EditManagerFormatVersion.v4, SharedTreeChangeFormatVersion.v4],
 	[EditManagerFormatVersion.vSharedBranches, SharedTreeChangeFormatVersion.v4],
 	[EditManagerFormatVersion.v6, SharedTreeChangeFormatVersion.v5],
+	[EditManagerFormatVersion.v7, SharedTreeChangeFormatVersion.v6],
 ]);
 
 /**
@@ -572,6 +574,7 @@ export const changeFormatVersionForMessage = DependentFormatVersion.fromPairs<
 	[MessageFormatVersion.v4, SharedTreeChangeFormatVersion.v4],
 	[MessageFormatVersion.vSharedBranches, SharedTreeChangeFormatVersion.v4],
 	[MessageFormatVersion.v6, SharedTreeChangeFormatVersion.v5],
+	[MessageFormatVersion.v7, SharedTreeChangeFormatVersion.v6],
 ]);
 
 function getCodecTreeForEditManagerFormat(clientVersion: MinimumVersionForCollab): CodecTree {

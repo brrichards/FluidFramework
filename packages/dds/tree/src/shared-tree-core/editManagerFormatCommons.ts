@@ -163,6 +163,11 @@ export const EditManagerFormatVersion = strictEnum("editManager.FormatVersion", 
 	 */
 	v6: 6,
 	/**
+	 * Introduced and made available for writing in 2.90.0
+	 * Adds support for SchemaFormatVersion.v3 (upgrade bundles).
+	 */
+	v7: 7,
+	/**
 	 * Not yet released.
 	 * Only used for testing shared branches.
 	 */
@@ -174,6 +179,7 @@ export const supportedEditManagerFormatVersions: ReadonlySet<EditManagerFormatVe
 		EditManagerFormatVersion.v3,
 		EditManagerFormatVersion.v4,
 		EditManagerFormatVersion.v6,
+		EditManagerFormatVersion.v7,
 		EditManagerFormatVersion.vSharedBranches,
 	]);
 export const editManagerFormatVersions: ReadonlySet<EditManagerFormatVersion> = new Set(

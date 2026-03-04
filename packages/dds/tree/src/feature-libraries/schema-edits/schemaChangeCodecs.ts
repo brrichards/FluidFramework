@@ -16,9 +16,11 @@ import {
 	withSchemaValidation,
 } from "../../codec/index.js";
 import { SchemaFormatVersion } from "../../core/index.js";
+import { defaultSchemaPolicy } from "../default-schema/index.js";
+import { allowsRepoSuperset } from "../modular-schema/index.js";
 import { makeSchemaCodec, schemaCodecBuilder } from "../schema-index/index.js";
 
-import { EncodedSchemaChange } from "./schemaChangeFormat.js";
+import { EncodedSchemaChange, EncodedSchemaChangeV3 } from "./schemaChangeFormat.js";
 import type { SchemaChange } from "./schemaChangeTypes.js";
 
 /**
@@ -43,6 +45,15 @@ export function makeSchemaChangeCodecs(
 		[
 			SchemaFormatVersion.v2,
 			makeSchemaChangeCodecV1(
+				{ ...options, allowPossiblyIncompatibleWriteVersionOverrides: true },
+				SchemaFormatVersion.v2,
+			),
+		],
+		// v3 adds the `upgradeBundle` flag for schema+data bundle ops produced by `upgradeSchemaOnNextEdit()`.
+		// Uses v2 inner schema format; same `allowPossiblyIncompatibleWriteVersionOverrides` pattern as v2.
+		[
+			SchemaFormatVersion.v3,
+			makeSchemaChangeCodecV3(
 				{ ...options, allowPossiblyIncompatibleWriteVersionOverrides: true },
 				SchemaFormatVersion.v2,
 			),
@@ -110,4 +121,41 @@ function makeSchemaChangeCodecV1(
 	};
 
 	return withSchemaValidation(EncodedSchemaChange, schemaChangeCodec, options.jsonValidator);
+}
+
+/**
+ * V3 schema change codec. Extends v1/v2 logic with support for the `upgradeBundle` flag.
+ * Uses v2 inner schema format for encoding `TreeStoredSchema`.
+ */
+function makeSchemaChangeCodecV3(
+	options: CodecWriteOptions,
+	schemaWriteVersion: SchemaFormatVersion,
+): IJsonCodec<SchemaChange, EncodedSchemaChangeV3> {
+	const schemaCodec = makeSchemaCodec(options, schemaWriteVersion);
+	const schemaChangeCodec: IJsonCodec<SchemaChange, EncodedSchemaChangeV3> = {
+		encode: (schemaChange) => {
+			assert(!schemaChange.isInverse, "Inverse schema changes should never be transmitted");
+			const encoded: EncodedSchemaChangeV3 = {
+				new: schemaCodec.encode(schemaChange.schema.new),
+				old: schemaCodec.encode(schemaChange.schema.old),
+			};
+			if (schemaChange.upgradeBundle === true) {
+				(encoded as { upgradeBundle?: true }).upgradeBundle = true;
+			}
+			return encoded;
+		},
+		decode: (encoded) => {
+			const oldSchema = schemaCodec.decode(encoded.old);
+			const newSchema = schemaCodec.decode(encoded.new);
+			return {
+				schema: { new: newSchema, old: oldSchema },
+				isInverse: false,
+				isExpansive: allowsRepoSuperset(defaultSchemaPolicy, oldSchema, newSchema),
+				upgradeBundle: encoded.upgradeBundle === true ? true : undefined,
+			};
+		},
+		encodedSchema: EncodedSchemaChangeV3,
+	};
+
+	return withSchemaValidation(EncodedSchemaChangeV3, schemaChangeCodec, options.jsonValidator);
 }

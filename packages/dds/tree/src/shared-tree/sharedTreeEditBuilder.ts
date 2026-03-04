@@ -26,8 +26,13 @@ export interface ISchemaEditor {
 	 * Updates the stored schema.
 	 * @param oldSchema - The schema being overwritten.
 	 * @param newSchema - The new schema to apply.
+	 * @param options - Optional settings for the schema change.
 	 */
-	setStoredSchema(oldSchema: TreeStoredSchema, newSchema: TreeStoredSchema): void;
+	setStoredSchema(
+		oldSchema: TreeStoredSchema,
+		newSchema: TreeStoredSchema,
+		options?: { readonly upgradeBundle?: boolean },
+	): void;
 }
 
 /**
@@ -67,7 +72,7 @@ export class SharedTreeEditBuilder
 		);
 
 		this.schema = {
-			setStoredSchema: (oldSchema, newSchema) => {
+			setStoredSchema: (oldSchema, newSchema, options) => {
 				this.changeReceiver({
 					revision: mintRevisionTag(),
 					change: {
@@ -77,6 +82,7 @@ export class SharedTreeEditBuilder
 								innerChange: {
 									schema: { new: newSchema, old: oldSchema },
 									isInverse: false,
+									upgradeBundle: options?.upgradeBundle,
 								},
 							},
 						],

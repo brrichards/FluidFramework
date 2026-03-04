@@ -9,6 +9,7 @@ import type { IFluidHandle, Listenable } from "@fluidframework/core-interfaces/i
 import { assert, unreachableCase, fail } from "@fluidframework/core-utils/internal";
 import type { IIdCompressor, SessionId } from "@fluidframework/id-compressor";
 import { isStableId } from "@fluidframework/id-compressor/internal";
+import type { MinimumVersionForCollab } from "@fluidframework/runtime-definitions/internal";
 import {
 	UsageError,
 	type ITelemetryLoggerExt,
@@ -386,6 +387,7 @@ export function createTreeCheckout(
 		args?.logger,
 		breaker,
 		args?.disposeForksAfterTransaction,
+		codecOptions.minVersionForCollab,
 	);
 }
 
@@ -483,6 +485,7 @@ export class TreeCheckout implements ITreeCheckoutFork {
 		private readonly logger?: ITelemetryLoggerExt,
 		public readonly breaker: Breakable = new Breakable("TreeCheckout"),
 		public readonly disposeForksAfterTransaction = true,
+		public readonly minVersionForCollab: MinimumVersionForCollab = FluidClientVersion.v2_0,
 	) {
 		this.#transaction = this.createTransactionStack(branch);
 		this.editLock = new EditLock(this.#transaction.activeBranchEditor);
@@ -1013,6 +1016,7 @@ export class TreeCheckout implements ITreeCheckoutFork {
 			this.logger,
 			this.breaker,
 			this.disposeForksAfterTransaction,
+			this.minVersionForCollab,
 		);
 		this.#events.emit("fork", checkout);
 		return checkout;

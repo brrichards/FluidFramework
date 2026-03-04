@@ -99,6 +99,11 @@ export const SharedTreeChangeFormatVersion = strictEnum("SharedTreeChangeFormatV
 	 * Adds support for "no change" constraints.
 	 */
 	v5: 5,
+	/**
+	 * Introduced and made available for writing in 2.90.0
+	 * Adds support for SchemaFormatVersion.v3 (upgrade bundles with `upgradeBundle` flag).
+	 */
+	v6: 6,
 });
 export type SharedTreeChangeFormatVersion = Values<typeof SharedTreeChangeFormatVersion>;
 
@@ -123,6 +128,10 @@ export const dependenciesForChangeFormat = new Map<
 	[
 		SharedTreeChangeFormatVersion.v5,
 		{ modularChange: ModularChangeFormatVersion.v5, schemaChange: SchemaFormatVersion.v1 },
+	],
+	[
+		SharedTreeChangeFormatVersion.v6,
+		{ modularChange: ModularChangeFormatVersion.v5, schemaChange: SchemaFormatVersion.v3 },
 	],
 ]);
 

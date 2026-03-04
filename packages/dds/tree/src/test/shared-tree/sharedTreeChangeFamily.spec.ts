@@ -10,6 +10,7 @@ import { deepFreeze } from "@fluidframework/test-runtime-utils/internal";
 import { currentVersion, type CodecWriteOptions } from "../../codec/index.js";
 import {
 	type DeltaDetachedNodeId,
+	type TreeNodeSchemaIdentifier,
 	type TreeStoredSchema,
 	makeAnonChange,
 	revisionMetadataSourceFromInfo,
@@ -20,6 +21,7 @@ import {
 import { forbidden } from "../../feature-libraries/default-schema/defaultFieldKinds.js";
 import {
 	DefaultEditBuilder,
+	FieldKinds,
 	ModularChangeFamily,
 	type ModularChangeset,
 	type TreeChunk,
@@ -29,6 +31,8 @@ import {
 	DefaultRevisionReplacer,
 	type FieldBatchCodec,
 	FieldBatchFormatVersion,
+	allowsRepoSuperset,
+	defaultSchemaPolicy,
 } from "../../feature-libraries/index.js";
 import {
 	SharedTreeChangeFamily,
@@ -463,6 +467,352 @@ describe("SharedTreeChangeFamily", () => {
 				new DefaultRevisionReplacer(newRevision, sharedTreeFamily.getRevisions(input)),
 			);
 			checkConsistency(updated);
+		});
+	});
+
+	describe("bundle rebase (schema + data changes)", () => {
+		// Test schemas for allowsRepoSuperset checks (Cases 7/9)
+		const schemaA: TreeStoredSchema = {
+			nodeSchema: new Map(),
+			rootFieldSchema: {
+				kind: FieldKinds.optional.identifier,
+				types: new Set(["typeA" as TreeNodeSchemaIdentifier]),
+				persistedMetadata: undefined,
+			},
+		};
+		const schemaB: TreeStoredSchema = {
+			nodeSchema: new Map(),
+			rootFieldSchema: {
+				kind: FieldKinds.optional.identifier,
+				types: new Set([
+					"typeA" as TreeNodeSchemaIdentifier,
+					"typeB" as TreeNodeSchemaIdentifier,
+				]),
+				persistedMetadata: undefined,
+			},
+		};
+		const schemaC: TreeStoredSchema = {
+			nodeSchema: new Map(),
+			rootFieldSchema: {
+				kind: FieldKinds.optional.identifier,
+				types: new Set(["typeC" as TreeNodeSchemaIdentifier]),
+				persistedMetadata: undefined,
+			},
+		};
+
+		// Verify test schema setup
+		it("test schema setup: allowsRepoSuperset relationships", () => {
+			// B is superset of A (A's types are subset of B's types)
+			assert.equal(allowsRepoSuperset(defaultSchemaPolicy, schemaA, schemaB), true);
+			// C is NOT superset of A (C has typeC, A needs typeA)
+			assert.equal(allowsRepoSuperset(defaultSchemaPolicy, schemaA, schemaC), false);
+			// A is NOT superset of B (A lacks typeB)
+			assert.equal(allowsRepoSuperset(defaultSchemaPolicy, schemaB, schemaA), false);
+		});
+
+		// Schema changes for bundle construction
+		const expansiveSchemaChange: SchemaChange = {
+			schema: { new: schemaB, old: schemaA },
+			isInverse: false,
+			isExpansive: true,
+			upgradeBundle: true,
+		};
+		const restrictiveSchemaChange: SchemaChange = {
+			schema: { new: schemaA, old: schemaB },
+			isInverse: false,
+			isExpansive: false,
+			upgradeBundle: true,
+		};
+		const schemaChangeAtoB: SchemaChange = {
+			schema: { new: schemaB, old: emptySchema },
+			isInverse: false,
+		};
+		const schemaChangeAtoC: SchemaChange = {
+			schema: { new: schemaC, old: emptySchema },
+			isInverse: false,
+		};
+
+		// Bundle changes: schema + data (produced by upgradeSchemaOnNextEdit)
+		const bundleChangeA: SharedTreeChange = {
+			changes: [
+				{
+					type: "schema",
+					innerChange: {
+						schema: { new: schemaA, old: emptySchema },
+						isInverse: false,
+						upgradeBundle: true,
+					},
+				},
+				{ type: "data", innerChange: dataChange1 },
+			],
+		};
+		const bundleChangeB: SharedTreeChange = {
+			changes: [
+				{
+					type: "schema",
+					innerChange: {
+						schema: { new: schemaB, old: emptySchema },
+						isInverse: false,
+						upgradeBundle: true,
+					},
+				},
+				{ type: "data", innerChange: dataChange1 },
+			],
+		};
+
+		// Bundle with expansive schema (for Case 6a)
+		const expansiveBundleChange: SharedTreeChange = {
+			changes: [
+				{ type: "schema", innerChange: expansiveSchemaChange },
+				{ type: "data", innerChange: dataChange1 },
+			],
+		};
+
+		// Bundle with restrictive schema (for Case 6b)
+		const restrictiveBundleChange: SharedTreeChange = {
+			changes: [
+				{ type: "schema", innerChange: restrictiveSchemaChange },
+				{ type: "data", innerChange: dataChange1 },
+			],
+		};
+
+		// Schema-only changes (for Cases 7, 8)
+		const schemaOnlyB: SharedTreeChange = {
+			changes: [{ type: "schema", innerChange: schemaChangeAtoB }],
+		};
+		const schemaOnlyC: SharedTreeChange = {
+			changes: [{ type: "schema", innerChange: schemaChangeAtoC }],
+		};
+
+		describe("Case 5: Bundle over data-only", () => {
+			it("preserves schema and rebases data", () => {
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(bundleChangeA),
+					makeAnonChange(stDataChange2),
+					revisionMetadataSourceFromInfo([]),
+				);
+				// Schema should be preserved, data should be rebased
+				assert.equal(result.changes.length, 2);
+				const schemaResult = result.changes[0];
+				const dataResult = result.changes[1];
+				assert.equal(schemaResult.type, "schema");
+				assert.deepEqual(schemaResult, bundleChangeA.changes[0]);
+				assert.equal(dataResult.type, "data");
+				// Data should be rebased over the data-only change
+				assert.deepEqual(
+					dataResult.innerChange,
+					modularFamily.rebase(
+						makeAnonChange(dataChange1),
+						makeAnonChange(dataChange2),
+						revisionMetadataSourceFromInfo([]),
+					),
+				);
+			});
+		});
+
+		describe("Case 6: Data-only over bundle", () => {
+			it("6a: rebases data when bundle has expansive schema", () => {
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(stDataChange2),
+					makeAnonChange(expansiveBundleChange),
+					revisionMetadataSourceFromInfo([]),
+				);
+				// Data should be rebased over the data portion of the bundle
+				assert.equal(result.changes.length, 1);
+				assert.equal(result.changes[0].type, "data");
+				assert.deepEqual(
+					result.changes[0].innerChange,
+					modularFamily.rebase(
+						makeAnonChange(dataChange2),
+						makeAnonChange(dataChange1),
+						revisionMetadataSourceFromInfo([]),
+					),
+				);
+			});
+
+			it("6b: drops data when bundle has restrictive schema", () => {
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(stDataChange2),
+					makeAnonChange(restrictiveBundleChange),
+					revisionMetadataSourceFromInfo([]),
+				);
+				assert.deepEqual(result, { changes: [] });
+			});
+
+			it("6b: drops data when bundle schema is inverse", () => {
+				const inverseBundleChange: SharedTreeChange = {
+					changes: [
+						{
+							type: "schema",
+							innerChange: {
+								schema: { new: schemaA, old: schemaB },
+								isInverse: true,
+								isExpansive: false,
+								upgradeBundle: true,
+							},
+						},
+						{ type: "data", innerChange: dataChange1 },
+					],
+				};
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(stDataChange2),
+					makeAnonChange(inverseBundleChange),
+					revisionMetadataSourceFromInfo([]),
+				);
+				assert.deepEqual(result, { changes: [] });
+			});
+		});
+
+		describe("Case 7: Bundle over schema-only", () => {
+			it("preserves data when their schema is a superset of ours", () => {
+				// bundleChangeA has new schema = schemaA
+				// schemaOnlyB has new schema = schemaB (superset of A)
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(bundleChangeA),
+					makeAnonChange(schemaOnlyB),
+					revisionMetadataSourceFromInfo([]),
+				);
+				// Our schema is dropped (redundant), our data is preserved
+				assert.equal(result.changes.length, 1);
+				assert.equal(result.changes[0].type, "data");
+			});
+
+			it("drops bundle when their schema is incompatible", () => {
+				// bundleChangeA has new schema = schemaA
+				// schemaOnlyC has new schema = schemaC (incompatible with A)
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(bundleChangeA),
+					makeAnonChange(schemaOnlyC),
+					revisionMetadataSourceFromInfo([]),
+				);
+				assert.deepEqual(result, { changes: [] });
+			});
+		});
+
+		describe("Case 8: Schema-only over bundle", () => {
+			it("drops the schema-only change", () => {
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(stSchemaChange),
+					makeAnonChange(expansiveBundleChange),
+					revisionMetadataSourceFromInfo([]),
+				);
+				assert.deepEqual(result, { changes: [] });
+			});
+		});
+
+		describe("Case 9: Bundle over bundle", () => {
+			it("preserves data when their schema is a superset of ours", () => {
+				// bundleChangeA has new schema = schemaA
+				// bundleChangeB has new schema = schemaB (superset of A)
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(bundleChangeA),
+					makeAnonChange(bundleChangeB),
+					revisionMetadataSourceFromInfo([]),
+				);
+				// Our schema is dropped, our data is preserved
+				assert.equal(result.changes.length, 1);
+				assert.equal(result.changes[0].type, "data");
+			});
+
+			it("drops bundle when schemas are incompatible", () => {
+				// bundleChangeA has new schema = schemaA
+				// Create a bundle with schemaC (incompatible)
+				const bundleChangeC: SharedTreeChange = {
+					changes: [
+						{
+							type: "schema",
+							innerChange: {
+								schema: { new: schemaC, old: emptySchema },
+								isInverse: false,
+								upgradeBundle: true,
+							},
+						},
+						{ type: "data", innerChange: dataChange2 },
+					],
+				};
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(bundleChangeA),
+					makeAnonChange(bundleChangeC),
+					revisionMetadataSourceFromInfo([]),
+				);
+				assert.deepEqual(result, { changes: [] });
+			});
+		});
+
+		describe("existing behavior preserved", () => {
+			it("non-bundle schema changes still conflict with all changes", () => {
+				// Schema-only over data-only (Case 2) — unchanged
+				assert.deepEqual(
+					sharedTreeFamily.rebase(
+						makeAnonChange(stSchemaChange),
+						makeAnonChange(stDataChange1),
+						revisionMetadataSourceFromInfo([]),
+					),
+					{ changes: [] },
+				);
+
+				// Data-only over schema-only (Case 3) — unchanged
+				assert.deepEqual(
+					sharedTreeFamily.rebase(
+						makeAnonChange(stDataChange1),
+						makeAnonChange(stSchemaChange),
+						revisionMetadataSourceFromInfo([]),
+					),
+					{ changes: [] },
+				);
+
+				// Schema-only over schema-only (Case 4) — unchanged
+				assert.deepEqual(
+					sharedTreeFamily.rebase(
+						makeAnonChange(stSchemaChange),
+						makeAnonChange(stSchemaChange),
+						revisionMetadataSourceFromInfo([]),
+					),
+					{ changes: [] },
+				);
+			});
+
+			it("data-only over data-only still rebases normally (Case 1)", () => {
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(stDataChange1),
+					makeAnonChange(stDataChange2),
+					revisionMetadataSourceFromInfo([]),
+				);
+				assert.deepEqual(result, {
+					changes: [
+						{
+							type: "data",
+							innerChange: modularFamily.rebase(
+								makeAnonChange(dataChange1),
+								makeAnonChange(dataChange2),
+								revisionMetadataSourceFromInfo([]),
+							),
+						},
+					],
+				});
+			});
+
+			it("empty changes still result in no-op rebases", () => {
+				// Bundle over empty
+				assert.deepEqual(
+					sharedTreeFamily.rebase(
+						makeAnonChange(bundleChangeA),
+						makeAnonChange(stEmptyChange),
+						revisionMetadataSourceFromInfo([]),
+					),
+					bundleChangeA,
+				);
+
+				// Empty over bundle
+				assert.deepEqual(
+					sharedTreeFamily.rebase(
+						makeAnonChange(stEmptyChange),
+						makeAnonChange(expansiveBundleChange),
+						revisionMetadataSourceFromInfo([]),
+					),
+					stEmptyChange,
+				);
+			});
 		});
 	});
 });

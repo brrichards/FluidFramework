@@ -8,6 +8,7 @@ import { strict as assert, fail } from "node:assert";
 import { UsageError } from "@fluidframework/telemetry-utils/internal";
 import { validateUsageError } from "@fluidframework/test-runtime-utils/internal";
 
+import { FluidClientVersion } from "../../codec/index.js";
 import type { TransactionLabels } from "../../core/index.js";
 import { MockNodeIdentifierManager, TreeStatus } from "../../feature-libraries/index.js";
 import {
@@ -37,6 +38,7 @@ import {
 	toUpgradeSchema,
 	SchemaFactoryBeta,
 } from "../../simple-tree/index.js";
+import { configuredSharedTree } from "../../treeFactory.js";
 import type { Mutable } from "../../util/index.js";
 import { brand } from "../../util/index.js";
 // eslint-disable-next-line import-x/no-internal-modules
@@ -65,6 +67,7 @@ const configGeneralized2 = new TreeViewConfiguration({
 function checkoutWithInitialTree(
 	viewConfig: TreeViewConfiguration,
 	unhydratedInitialTree: InsertableField<UnsafeUnknownSchema>,
+	args?: { codecOptions?: Partial<import("../../codec/index.js").CodecWriteOptions> },
 ): TreeCheckout {
 	const initialTree = fieldCursorFromInsertable<UnsafeUnknownSchema>(
 		viewConfig.schema,
@@ -74,7 +77,7 @@ function checkoutWithInitialTree(
 		schema: toInitialSchema(viewConfig.schema),
 		initialTree,
 	};
-	return checkoutWithContent(treeContent);
+	return checkoutWithContent(treeContent, args);
 }
 
 // Schema for tree that must always be empty.
@@ -1482,6 +1485,250 @@ describe("SchematizingSimpleTreeView", () => {
 			assert.equal(receivedLabels.tree.label, undefined);
 			assert.equal(receivedLabels.tree.sublabels.length, 1);
 			assert.equal(receivedLabels.tree.sublabels[0]?.label, "inner");
+		});
+	});
+
+	describe("upgradeSchemaOnNextEdit", () => {
+		const v2_90Options = {
+			codecOptions: { minVersionForCollab: FluidClientVersion.v2_90 },
+		};
+
+		it("makes canView true immediately without sending an op", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			assert.equal(view.compatibility.canView, false);
+			assert.equal(view.compatibility.canUpgrade, true);
+
+			view.upgradeSchemaOnNextEdit();
+
+			// canView should now be true — the schema is upgraded locally
+			assert.equal(view.compatibility.canView, true);
+			assert.equal(view.root, 5);
+
+			// The transaction should still be open (no op sent yet)
+			assert.equal(checkout.transaction.size, 1);
+
+			view.dispose();
+		});
+
+		it("commits the transaction on the first edit, producing a bundled op", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// Make the first edit — listener is registered synchronously, no await needed
+			view.root = "hello";
+
+			// The transaction should now be committed
+			assert.equal(checkout.transaction.size, 0);
+
+			view.dispose();
+		});
+
+		it("rolls back the transaction on disposal if no edit was made", async () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// Dispose without editing — should abort the transaction
+			view.dispose();
+			assert.equal(checkout.transaction.size, 0);
+		});
+
+		it("is a no-op when schema is already equivalent", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				config,
+				new MockNodeIdentifierManager(),
+			);
+
+			assert.equal(view.compatibility.isEquivalent, true);
+			view.upgradeSchemaOnNextEdit();
+
+			// No transaction should be started
+			assert.equal(checkout.transaction.size, 0);
+
+			view.dispose();
+		});
+
+		it("throws when schema cannot be upgraded", () => {
+			const checkout = checkoutWithInitialTree(configGeneralized, 6, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				config,
+				new MockNodeIdentifierManager(),
+			);
+
+			assert.equal(view.compatibility.canUpgrade, false);
+			assert.throws(
+				() => view.upgradeSchemaOnNextEdit(),
+				validateUsageError(/cannot be upgraded/),
+			);
+		});
+
+		it("throws when minVersionForCollab is too old", () => {
+			const checkout = checkoutWithInitialTree(config, 5);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			assert.equal(view.compatibility.canUpgrade, true);
+			assert.throws(
+				() => view.upgradeSchemaOnNextEdit(),
+				validateUsageError(/minVersionForCollab/),
+			);
+		});
+
+		it("propagates bundled schema+data op to another peer", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+
+			// Tree 1 initializes with the narrow schema (number only)
+			const tree1 = provider.trees[0];
+			const view1 = tree1.viewWith(config);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			// Tree 2 opens with the generalized schema (number | string)
+			const tree2 = provider.trees[1];
+			const view2 = tree2.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			assert.equal(view2.compatibility.canUpgrade, true);
+
+			// Tree 2 defers the schema upgrade and edits
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello";
+
+			// Synchronize — the bundled op (schema + data) propagates to tree1
+			provider.synchronizeMessages();
+
+			// Tree1's narrow view is now out of schema; reopen with generalized schema
+			view1.dispose();
+			const view1Generalized = tree1.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			// Both peers should have the same value
+			assert.equal(view1Generalized.root, "hello");
+			assert.equal(view2.root, "hello");
+
+			view1Generalized.dispose();
+			view2.dispose();
+		});
+
+		it("converges with a concurrent data edit from another peer", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+
+			const tree1 = provider.trees[0];
+			const view1 = tree1.viewWith(config);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			const tree2 = provider.trees[1];
+			const view2 = tree2.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			// Tree 2 defers the schema upgrade and edits
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello";
+
+			// Tree 1 makes a concurrent edit before sync
+			view1.root = 42;
+
+			// Synchronize — both trees must converge to the same state
+			provider.synchronizeMessages();
+
+			// Reopen tree1 with generalized schema (tree2's upgrade propagated)
+			view1.dispose();
+			const view1Generalized = tree1.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			assert.equal(view1Generalized.root, view2.root);
+
+			view1Generalized.dispose();
+			view2.dispose();
+		});
+
+		it("produces no op when disposed without editing", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+
+			const tree1 = provider.trees[0];
+			const view1 = tree1.viewWith(config);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			const tree2 = provider.trees[1];
+			const view2 = tree2.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			// Defer upgrade but never edit — then dispose
+			view2.upgradeSchemaOnNextEdit();
+			view2.dispose();
+
+			provider.synchronizeMessages();
+
+			// Tree 1 should still have its original value — no schema op was sent
+			view1.dispose();
+			const view1Check = tree1.viewWith(config);
+			assert.equal(view1Check.root, 5);
+			view1Check.dispose();
+		});
+
+		it("is idempotent — calling twice does not start a second transaction", async () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// Call again — should be a no-op
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			view.dispose();
 		});
 	});
 });

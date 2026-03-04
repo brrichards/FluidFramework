@@ -40,6 +40,12 @@ export const SchemaFormatVersion = strictEnum("SchemaFormatVersion", {
 	 * Adds persisted metadata to the node schema and field schema.
 	 */
 	v2: 2,
+	/**
+	 * Adds support for upgrade bundles (schema + data ops produced by `upgradeSchemaOnNextEdit()`).
+	 * The encoded schema change includes an optional `upgradeBundle` flag that enables
+	 * the bundle-specific rebase behavior.
+	 */
+	v3: 3,
 });
 export type SchemaFormatVersion = Values<typeof SchemaFormatVersion>;
 

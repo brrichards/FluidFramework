@@ -37,6 +37,7 @@ import {
 	nestedSetContains,
 } from "../util/index.js";
 
+import { isUpgradeBundle, rebaseBundled } from "./schemaDataBundleRebase.js";
 import { makeSharedTreeChangeCodecFamily } from "./sharedTreeChangeCodecs.js";
 import type { SharedTreeChange } from "./sharedTreeChangeTypes.js";
 import { SharedTreeEditBuilder } from "./sharedTreeEditBuilder.js";
@@ -173,15 +174,34 @@ export class SharedTreeChangeFamily
 			return change.change;
 		}
 
-		if (hasSchemaChange(change.change) || hasSchemaChange(over.change)) {
-			// Any SharedTreeChange (a list of sub-changes) that contains a schema change will cause ANY change that rebases over it to conflict.
-			// Similarly, any SharedTreeChange containing a schema change will fail to rebase over ANY change.
-			// Those two combine to mean: no concurrency with schema changes is supported.
-			// This is fine because it's an open problem. Example: a tree with an A at the root and a schema that allows an A | B at the root will
-			// become out of schema if a schema changes to restrict root types to just A is concurrent with a data change that sets it to a B.
-			// We don't have an efficient way to detect this document-wide and there are varying opinions on restricting schema changes to prevent this.
-			// A SharedTreeChange containing a schema change will NOT conflict in a non-concurrency case, as the "meatless sandwich" optimization
-			// will result in rebase never being called.
+		const changeHasSchema = hasSchemaChange(change.change);
+		const overHasSchema = hasSchemaChange(over.change);
+		// Bundle detection uses the `upgradeBundle` flag on schema changes, not structural detection.
+		// This ensures that `initialize()` bundles (which lack the flag) use the existing blanket
+		// invalidation path, while `upgradeSchemaOnNextEdit()` bundles use the new Cases 5-9 logic.
+		const changeIsBundle = isUpgradeBundle(change.change);
+		const overIsBundle = isUpgradeBundle(over.change);
+
+		// Bundle-specific rebase logic (Cases 5-9).
+		// Only applies when at least one side is a bundled change (schema+data with `upgradeBundle` flag).
+		// Bundled changes are produced by upgradeSchemaOnNextEdit().
+		if (changeIsBundle || overIsBundle) {
+			return rebaseBundled(
+				this.modularChangeFamily,
+				change,
+				over,
+				revisionMetadata,
+				changeHasSchema,
+				overHasSchema,
+				changeIsBundle,
+				overIsBundle,
+			);
+		}
+
+		if (changeHasSchema || overHasSchema) {
+			// Blanket invalidation for non-bundle schema changes (unchanged).
+			// Regular upgradeSchema() produces schema-only changes, regular edits produce
+			// data-only changes. Their interaction continues to use the old blanket-drop behavior.
 			return SharedTreeChangeFamily.emptyChange;
 		}
 		assert(

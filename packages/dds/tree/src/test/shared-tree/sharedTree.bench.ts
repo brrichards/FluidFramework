@@ -13,6 +13,7 @@ import {
 } from "@fluid-tools/benchmark";
 import { FlushMode } from "@fluidframework/runtime-definitions/internal";
 
+import { FluidClientVersion } from "../../codec/index.js";
 import { EmptyKey, rootFieldKey, type NormalizedUpPath } from "../../core/index.js";
 import { FormatValidatorBasic } from "../../external-utilities/index.js";
 import {
@@ -21,7 +22,11 @@ import {
 	type Context,
 } from "../../feature-libraries/index.js";
 import { Tree } from "../../shared-tree/index.js";
-import { TreeViewConfiguration } from "../../simple-tree/index.js";
+import {
+	SchematizingSimpleTreeView,
+	// eslint-disable-next-line import-x/no-internal-modules
+} from "../../shared-tree/schematizingTreeView.js";
+import { SchemaFactory, TreeViewConfiguration } from "../../simple-tree/index.js";
 import { configuredSharedTree } from "../../treeFactory.js";
 import { makeArray } from "../../util/index.js";
 import {
@@ -649,6 +654,101 @@ describe("SharedTree benchmarks", () => {
 			});
 			if (!isInPerformanceTestingMode) {
 				test.timeout(5000);
+			}
+		}
+	});
+
+	describe("upgradeSchemaOnNextEdit", () => {
+		const sf = new SchemaFactory("upgrade-schema-bench");
+		const narrowConfig = new TreeViewConfiguration({
+			schema: sf.number,
+		});
+		const generalizedConfig = new TreeViewConfiguration({
+			schema: [sf.number, sf.string],
+		});
+		const upgradeFactory = configuredSharedTree({
+			jsonValidator: FormatValidatorBasic,
+			minVersionForCollab: FluidClientVersion.v2_90,
+		}).getFactory();
+
+		for (const remoteOpCount of [1, 10, 100]) {
+			const baseline = benchmark({
+				type: remoteOpCount === 100 ? BenchmarkType.Measurement : BenchmarkType.Perspective,
+				title: `Baseline: process ${remoteOpCount} remote ops without deferred upgrade`,
+				benchmarkFnCustom: async <T>(state: BenchmarkTimer<T>) => {
+					let duration: number;
+					do {
+						assert.equal(state.iterationsPerBatch, 1);
+
+						const provider = new TestTreeProviderLite(2, upgradeFactory);
+						const [tree1, tree2] = provider.trees;
+
+						const view1 = tree1.viewWith(narrowConfig);
+						view1.initialize(0);
+						provider.synchronizeMessages();
+
+						// Tree2 opens with same schema, no deferred upgrade
+						const view2 = tree2.viewWith(narrowConfig);
+
+						const before = state.timer.now();
+						for (let i = 1; i <= remoteOpCount; i++) {
+							view1.root = i;
+							provider.synchronizeMessages();
+						}
+						const after = state.timer.now();
+						duration = state.timer.toSeconds(before, after);
+
+						view2.dispose();
+						view1.dispose();
+					} while (state.recordBatch(duration));
+				},
+				minBatchDurationSeconds: 0,
+			});
+			if (!isInPerformanceTestingMode) {
+				baseline.timeout(10000);
+			}
+
+			const test = benchmark({
+				type: remoteOpCount === 100 ? BenchmarkType.Measurement : BenchmarkType.Perspective,
+				title: `Process ${remoteOpCount} remote ops while deferred upgrade is pending`,
+				benchmarkFnCustom: async <T>(state: BenchmarkTimer<T>) => {
+					let duration: number;
+					do {
+						assert.equal(state.iterationsPerBatch, 1);
+
+						// Setup: two trees, tree2 has a pending deferred upgrade
+						const provider = new TestTreeProviderLite(2, upgradeFactory);
+						const [tree1, tree2] = provider.trees;
+
+						const view1 = tree1.viewWith(narrowConfig);
+						view1.initialize(0);
+						provider.synchronizeMessages();
+
+						const view2 = tree2.viewWith(
+							generalizedConfig,
+						) as unknown as SchematizingSimpleTreeView<
+							readonly [typeof sf.number, typeof sf.string]
+						>;
+						view2.upgradeSchemaOnNextEdit();
+
+						// Measure: process N remote ops (each triggers abort+restart loop)
+						const before = state.timer.now();
+						for (let i = 1; i <= remoteOpCount; i++) {
+							view1.root = i;
+							provider.synchronizeMessages();
+						}
+						const after = state.timer.now();
+						duration = state.timer.toSeconds(before, after);
+
+						// Cleanup
+						view2.dispose();
+						view1.dispose();
+					} while (state.recordBatch(duration));
+				},
+				minBatchDurationSeconds: 0,
+			});
+			if (!isInPerformanceTestingMode) {
+				test.timeout(10000);
 			}
 		}
 	});

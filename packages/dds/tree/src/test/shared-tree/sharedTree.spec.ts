@@ -2915,4 +2915,277 @@ describe("SharedTree", () => {
 		assert.equal(view1.root.content, 1);
 		assert.equal(view2.root.content, 2);
 	});
+
+	describe("upgradeSchemaOnNextEdit", () => {
+		const sf = new SchemaFactory("upgrade-schema-on-next-edit-test");
+		const NumberRoot = sf.number;
+		const GeneralizedRoot = [sf.number, sf.string];
+		const narrowConfig = new TreeViewConfiguration({
+			schema: NumberRoot,
+			enableSchemaValidation,
+		});
+		const generalizedConfig = new TreeViewConfiguration({
+			schema: GeneralizedRoot,
+			enableSchemaValidation,
+		});
+
+		it("bundles schema and data changes into a single op", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(narrowConfig);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			// Spy on tree2's submitted ops
+			const submittedOps: unknown[] = [];
+			const tree2Internal = tree2 as unknown as {
+				submitLocalMessage: (content: unknown, localOpMetadata?: unknown) => void;
+			};
+			const originalSubmit = tree2Internal.submitLocalMessage.bind(tree2);
+			tree2Internal.submitLocalMessage = (
+				content: unknown,
+				localOpMetadata?: unknown,
+			): void => {
+				submittedOps.push(content);
+				originalSubmit(content, localOpMetadata);
+			};
+
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello";
+
+			// Verify exactly one op was submitted by SharedTree
+			assert.equal(submittedOps.length, 1, "Expected exactly one submitted op");
+
+			// Verify the single op contains both schema and data changes
+			const op = submittedOps[0] as { changeset: { schema?: unknown; data?: unknown }[] };
+			const changeset = op.changeset;
+			assert(Array.isArray(changeset), "Op should have a changeset array");
+			const hasSchema = changeset.some(
+				(entry: { schema?: unknown }) => entry.schema !== undefined,
+			);
+			const hasData = changeset.some((entry: { data?: unknown }) => entry.data !== undefined);
+			assert(hasSchema, "Bundled op must contain a schema change");
+			assert(hasData, "Bundled op must contain a data change");
+		});
+
+		it("bundled op propagates to another peer", async () => {
+			const provider = await TestTreeProvider.create(
+				2,
+				SummarizeType.disabled,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			// Initialize tree1 with narrow schema + value 5
+			const view1Narrow = tree1.viewWith(narrowConfig);
+			view1Narrow.initialize(5);
+			await provider.ensureSynchronized();
+
+			// Tree2 opens with generalized schema, upgrades on next edit, and sets root
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello";
+
+			await provider.ensureSynchronized();
+
+			// Dispose tree1's narrow view and reopen with generalized config
+			view1Narrow.dispose();
+			const view1General = tree1.viewWith(generalizedConfig);
+
+			assert.equal(view1General.root, "hello");
+			assert.equal(view2.root, "hello");
+			validateTreeConsistency(tree1, tree2);
+		});
+
+		it("late joiner loads bundled state from summary", async () => {
+			const provider = await TestTreeProvider.create(
+				1,
+				SummarizeType.onDemand,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const tree1 = provider.trees[0];
+
+			// Initialize with narrow schema + value 5
+			const view1Narrow = tree1.viewWith(narrowConfig);
+			view1Narrow.initialize(5);
+
+			// Open generalized view, upgrade on next edit, set root
+			view1Narrow.dispose();
+			const view1General = tree1.viewWith(
+				generalizedConfig,
+			) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view1General.upgradeSchemaOnNextEdit();
+			view1General.root = "hello";
+
+			await provider.ensureSynchronized();
+			await provider.summarize();
+
+			// Create late joiner
+			const lateJoiner = await provider.createTree();
+			const lateView = lateJoiner.viewWith(generalizedConfig);
+
+			assert.equal(lateView.root, "hello");
+		});
+
+		it("no-op when disposed without editing", async () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			// Initialize tree1 with narrow schema + value 5
+			const view1 = tree1.viewWith(narrowConfig);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			// Tree2 opens generalized view, calls upgradeSchemaOnNextEdit, then disposes WITHOUT editing
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.dispose();
+
+			const seqBefore = provider.sequenceNumber;
+			provider.synchronizeMessages();
+			const seqAfter = provider.sequenceNumber;
+
+			// No ops should have been sent since no edit was made
+			assert.equal(seqAfter, seqBefore, "Expected zero ops when disposed without editing");
+
+			// Dispose tree1's view and reopen with narrow config — should still work since no schema change happened
+			view1.dispose();
+			const view1Reopened = tree1.viewWith(narrowConfig);
+			assert.equal(view1Reopened.root, 5);
+		});
+
+		it("read-only client sees remote edits while deferred upgrade is pending", async () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			// Initialize tree1 with narrow schema + value 5
+			const view1 = tree1.viewWith(narrowConfig);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			// Tree2: call upgradeSchemaOnNextEdit but DON'T edit (simulates read-only client)
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2.upgradeSchemaOnNextEdit();
+
+			// Tree1 makes a remote edit while tree2's deferred upgrade is pending
+			view1.root = 42;
+			provider.synchronizeMessages();
+
+			// The loop detects the remote op and aborts+restarts on the next microtask
+			await Promise.resolve();
+
+			// Tree2 should see the remote edit
+			assert.equal(view2.root, 42, "Read-only client should see remote edits");
+		});
+
+		it("concurrent edits converge", async () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			// Initialize tree1 with narrow schema + value 5
+			const view1Narrow = tree1.viewWith(narrowConfig);
+			view1Narrow.initialize(5);
+			provider.synchronizeMessages();
+
+			// Tree2: upgradeSchemaOnNextEdit + set root = "hello"
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello";
+
+			// Tree1: concurrent edit before sync (set root = 42)
+			view1Narrow.root = 42;
+
+			provider.synchronizeMessages();
+
+			// Dispose tree1's narrow view, reopen with generalized config
+			view1Narrow.dispose();
+			const view1General = tree1.viewWith(generalizedConfig);
+
+			// Both peers should converge to the same value
+			assert.equal(view1General.root, view2.root);
+			validateTreeConsistency(tree1, tree2);
+		});
+
+		it("disconnect/reconnect resubmits bundled op", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			// Initialize tree1 with narrow schema + value 5
+			const view1Narrow = tree1.viewWith(narrowConfig);
+			view1Narrow.initialize(5);
+			provider.synchronizeMessages();
+
+			// Disconnect tree2
+			tree2.containerRuntime.connected = false;
+
+			// Tree2 opens generalized view, upgrades on next edit, sets root while disconnected
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello";
+
+			// Reconnect tree2
+			tree2.containerRuntime.connected = true;
+			provider.synchronizeMessages();
+
+			// Dispose tree1's narrow view, reopen with generalized config
+			view1Narrow.dispose();
+			const view1General = tree1.viewWith(generalizedConfig);
+
+			assert.equal(view1General.root, "hello");
+			assert.equal(view2.root, "hello");
+			validateTreeConsistency(tree1, tree2);
+		});
+	});
 });

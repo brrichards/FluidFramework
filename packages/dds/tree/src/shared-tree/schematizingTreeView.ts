@@ -310,56 +310,95 @@ export class SchematizingSimpleTreeView<
 			);
 		}
 
-		// Listen for the next edit (afterBatch) to commit the transaction.
-		// The schema upgrade triggers afterBatch synchronously during runSchemaEdit(),
-		// so we register the listener first and skip that initial firing.
-		let committed = false;
-		let skipFirst = true;
+		let stopped = false;
 
-		const commitOnNextEdit = (): void => {
-			if (committed) {
-				return;
+		const runLoop = async (): Promise<void> => {
+			while (!stopped) {
+				// Re-check compatibility each iteration — a remote schema change
+				// during a previous abort may have made the upgrade unnecessary or impossible.
+				const compat = this.compatibility;
+				if (compat.isEquivalent || !compat.canUpgrade) {
+					this.deferredUpgradeCleanup = undefined;
+					return;
+				}
+
+				this.checkout.transaction.start();
+				this.runSchemaEdit(() => {
+					const newSchema = toUpgradeSchema(this.viewSchema.viewSchema.root);
+					this.checkout.editor.schema.setStoredSchema(
+						this.checkout.storedSchema.clone(),
+						newSchema,
+						{ upgradeBundle: true },
+					);
+				});
+
+				// Race: local edit (commit) vs remote change (abort+restart) vs dispose (abort+exit)
+				const reason = await new Promise<"edit" | "remote" | "stop">((resolve) => {
+					let resolved = false;
+
+					const settle = (r: "edit" | "remote" | "stop"): void => {
+						if (resolved) return;
+						resolved = true;
+						unregAfterBatch();
+						unregChanged();
+						resolve(r);
+					};
+
+					// afterBatch fires on the fork — detects local edits.
+					// Registered after runSchemaEdit(), so the schema upgrade's
+					// afterBatch has already fired and won't be seen here.
+					const unregAfterBatch = this.checkout.events.on("afterBatch", () => {
+						// Commit synchronously to prevent race with remote op abort.
+						this.checkout.transaction.commit();
+						this.deferredUpgradeCleanup = undefined;
+						settle("edit");
+					});
+
+					// changed fires on the main branch — detects remote ops.
+					const unregChanged = this.checkout.events.on("changed", (data) => {
+						if (!data.isLocal) {
+							settle("remote");
+						}
+					});
+
+					this.deferredUpgradeCleanup = () => {
+						stopped = true;
+						// Unregister listeners and abort synchronously before the
+						// rest of dispose runs (which may dispose the checkout).
+						settle("stop");
+						this.midUpgrade = true;
+						this.checkout.transaction.abort();
+						this.midUpgrade = false;
+						this.deferredUpgradeCleanup = undefined;
+					};
+				});
+
+				if (reason === "edit") {
+					// Transaction already committed synchronously in afterBatch handler.
+					return;
+				}
+
+				if (reason === "stop") {
+					// Transaction already aborted synchronously in deferredUpgradeCleanup.
+					return;
+				}
+
+				// Remote op — abort transaction (view catches up via viewUpdate),
+				// then loop back to re-apply the schema upgrade on a fresh fork.
+				// Guard: if dispose ran during the microtask gap between settle("remote")
+				// and here, the transaction was already aborted by deferredUpgradeCleanup.
+				if (stopped) {
+					return;
+				}
+				// Suppress events during abort since runSchemaEdit in the next
+				// iteration will fire them after re-applying the schema upgrade.
+				this.midUpgrade = true;
+				this.checkout.transaction.abort();
+				this.midUpgrade = false;
 			}
-			committed = true;
-			cleanup();
-			this.checkout.transaction.commit();
 		};
 
-		const abortUpgrade = (): void => {
-			if (committed) {
-				return;
-			}
-			committed = true;
-			cleanup();
-			this.checkout.transaction.abort();
-		};
-
-		const unregisterAfterBatch = this.checkout.events.on("afterBatch", () => {
-			if (skipFirst) {
-				skipFirst = false;
-				return;
-			}
-			commitOnNextEdit();
-		});
-
-		const cleanup = (): void => {
-			unregisterAfterBatch();
-			this.deferredUpgradeCleanup = undefined;
-		};
-
-		this.deferredUpgradeCleanup = abortUpgrade;
-
-		// Start a transaction and apply the schema upgrade inside it.
-		// The transaction stays open until the first edit, producing a bundled op.
-		this.checkout.transaction.start();
-		this.runSchemaEdit(() => {
-			const newSchema = toUpgradeSchema(this.viewSchema.viewSchema.root);
-			this.checkout.editor.schema.setStoredSchema(
-				this.checkout.storedSchema.clone(),
-				newSchema,
-				{ upgradeBundle: true },
-			);
-		});
+		runLoop().catch(() => {});
 	}
 
 	/**

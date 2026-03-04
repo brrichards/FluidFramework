@@ -1527,7 +1527,7 @@ describe("SchematizingSimpleTreeView", () => {
 			view.upgradeSchemaOnNextEdit();
 			assert.equal(checkout.transaction.size, 1);
 
-			// Make the first edit — listener is registered synchronously, no await needed
+			// Make the first edit — commit happens synchronously in afterBatch handler
 			view.root = "hello";
 
 			// The transaction should now be committed

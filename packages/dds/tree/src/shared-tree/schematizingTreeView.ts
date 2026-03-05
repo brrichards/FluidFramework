@@ -276,14 +276,22 @@ export class SchematizingSimpleTreeView<
 	}
 
 	/**
-	 * Upgrades the document schema to match the view schema, but defers sending the
-	 * schema change op until the first edit is made. This opens a transaction, applies
-	 * the schema upgrade inside it, and commits on the first subsequent edit — producing
-	 * a bundled op (schema + data) via the transaction squash.
+	 * Provides a way for applications that need a schema upgrade to view the document using the
+	 * new schema without writing the schema change to remote clients until the first edit.
+	 *
+	 * When an application updates its view schema (e.g., a previously staged allowed type is
+	 * finalized), it cannot view documents whose stored schema has not been upgraded — accessing
+	 * {@link TreeView.root} will throw. This method upgrades the stored schema locally so the
+	 * view becomes usable immediately, while deferring the schema change op until the user's
+	 * first edit. The schema upgrade and data edit are then sent as a single bundled op.
 	 *
 	 * If no edit is ever made, the transaction is rolled back on disposal and no op is sent.
 	 *
-	 * @remarks Read-only clients that never edit will never cause a schema op to be sent.
+	 * @remarks
+	 * - Read-only clients that never edit will never cause a schema op to be sent.
+	 *
+	 * - This maintains an open transaction internally. Forking or branching the view while
+	 *   a deferred upgrade is pending is not supported and will throw.
 	 */
 	public upgradeSchemaOnNextEdit(): void {
 		this.ensureUndisposed();

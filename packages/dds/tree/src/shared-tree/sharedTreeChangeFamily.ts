@@ -174,31 +174,18 @@ export class SharedTreeChangeFamily
 			return change.change;
 		}
 
-		const changeHasSchema = hasSchemaChange(change.change);
-		const overHasSchema = hasSchemaChange(over.change);
-		// Bundle detection uses the `upgradeBundle` flag on schema changes, not structural detection.
-		// This ensures that `initialize()` bundles (which lack the flag) use the existing blanket
-		// invalidation path, while `upgradeSchemaOnNextEdit()` bundles use the new Cases 5-9 logic.
 		const changeIsBundle = isUpgradeBundle(change.change);
 		const overIsBundle = isUpgradeBundle(over.change);
 
 		// Bundle-specific rebase logic (Cases 5-9).
 		// Only applies when at least one side is a bundled change (schema+data with `upgradeBundle` flag).
 		// Bundled changes are produced by upgradeSchemaOnNextEdit().
+		// Non-bundle schema changes (from initialize() or upgradeSchema()) use the blanket-drop path below.
 		if (changeIsBundle || overIsBundle) {
-			return rebaseBundled(
-				this.modularChangeFamily,
-				change,
-				over,
-				revisionMetadata,
-				changeHasSchema,
-				overHasSchema,
-				changeIsBundle,
-				overIsBundle,
-			);
+			return rebaseBundled(this.modularChangeFamily, change, over, revisionMetadata);
 		}
 
-		if (changeHasSchema || overHasSchema) {
+		if (hasSchemaChange(change.change) || hasSchemaChange(over.change)) {
 			// Blanket invalidation for non-bundle schema changes (unchanged).
 			// Regular upgradeSchema() produces schema-only changes, regular edits produce
 			// data-only changes. Their interaction continues to use the old blanket-drop behavior.

@@ -319,6 +319,13 @@ export class SchematizingSimpleTreeView<
 				const compat = this.compatibility;
 				if (compat.isEquivalent || !compat.canUpgrade) {
 					this.deferredUpgradeCleanup = undefined;
+					if (!compat.isEquivalent) {
+						// The schema was shown as upgraded (from the initial runSchemaEdit),
+						// but a remote op made the upgrade impossible. Emit events so
+						// listeners know the schema has reverted.
+						this.events.emit("schemaChanged");
+						this.events.emit("rootChanged");
+					}
 					return;
 				}
 
@@ -398,7 +405,9 @@ export class SchematizingSimpleTreeView<
 			}
 		};
 
-		runLoop().catch(() => {});
+		runLoop().catch((error) => {
+			this.breaker.break(error);
+		});
 	}
 
 	/**

@@ -14,6 +14,7 @@ import {
 } from "../core/index.js";
 import {
 	type ModularChangeFamily,
+	type ModularChangeset,
 	allowsRepoSuperset,
 	defaultSchemaPolicy,
 } from "../feature-libraries/index.js";
@@ -21,16 +22,8 @@ import {
 import type { SharedTreeChange, SharedTreeInnerChange } from "./sharedTreeChangeTypes.js";
 
 /**
- * Returns true iff the given change contains at least one data (non-schema) inner change.
- * Counterpart to the existing `hasSchemaChange()`.
- */
-export function hasDataChange(change: SharedTreeChange): boolean {
-	return change.changes.some((innerChange) => innerChange.type === "data");
-}
-
-/**
- * Returns true iff the given change is an upgrade bundle: a change containing both
- * schema and data inner changes where the schema change has the `upgradeBundle` flag set.
+ * Returns true iff the given change is an upgrade bundle: a change containing
+ * a schema change with the `upgradeBundle` flag set.
  * This distinguishes `upgradeSchemaOnNextEdit()` bundles from `initialize()` bundles.
  */
 export function isUpgradeBundle(change: SharedTreeChange): boolean {
@@ -88,7 +81,7 @@ function isExpansiveSchemaChange(change: SharedTreeChange): boolean {
 }
 
 /**
- * Rebase helpers for bundled changes (schema + data produced by `upgradeSchemaOnNextEdit()`).
+ * Rebase logic for bundled changes (schema + data produced by `upgradeSchemaOnNextEdit()`).
  * Implements Cases 5-9 from the rebase table.
  */
 export function rebaseBundled(
@@ -96,20 +89,21 @@ export function rebaseBundled(
 	change: TaggedChange<SharedTreeChange>,
 	over: TaggedChange<SharedTreeChange>,
 	revisionMetadata: RevisionMetadataSource,
-	changeHasSchema: boolean,
-	overHasSchema: boolean,
-	changeIsBundle: boolean,
-	overIsBundle: boolean,
 ): SharedTreeChange {
+	const changeIsBundle = isUpgradeBundle(change.change);
+	const overIsBundle = isUpgradeBundle(over.change);
+	const changeHasSchema = change.change.changes.some((c) => c.type === "schema");
+	const overHasSchema = over.change.changes.some((c) => c.type === "schema");
+
 	// Case 5: Bundle over data-only → schema preserved, data rebased
 	if (changeIsBundle && !overHasSchema) {
-		return rebasePreservingSchema(modularChangeFamily, change, over, revisionMetadata);
+		return rebaseDataChanges(modularChangeFamily, change, over, revisionMetadata, true);
 	}
 
 	// Case 6a/6b: Data-only over bundle
 	if (!changeHasSchema && overIsBundle) {
 		if (isExpansiveSchemaChange(over.change)) {
-			return rebaseDataOverExpandedSchema(modularChangeFamily, change, over, revisionMetadata);
+			return rebaseDataChanges(modularChangeFamily, change, over, revisionMetadata, false);
 		}
 		return { changes: [] }; // 6b: restrictive → drop
 	}
@@ -121,7 +115,7 @@ export function rebaseBundled(
 
 		if (allowsRepoSuperset(defaultSchemaPolicy, ourSchema, theirSchema)) {
 			// Their schema supports ours — drop our schema, rebase our data
-			return rebaseDataOnly(modularChangeFamily, change, over, revisionMetadata);
+			return rebaseDataChanges(modularChangeFamily, change, over, revisionMetadata, false);
 		}
 		return { changes: [] }; // Incompatible → drop
 	}
@@ -136,111 +130,63 @@ export function rebaseBundled(
 }
 
 /**
- * Case 5: Our bundle rebases over their data-only change.
- * Schema is preserved unchanged, data is rebased over their data.
+ * Rebases data changes from `change` over data changes from `over`.
+ * When `preserveSchema` is true, schema changes from `change` are kept in the output.
  */
-function rebasePreservingSchema(
+function rebaseDataChanges(
 	modularChangeFamily: ModularChangeFamily,
 	change: TaggedChange<SharedTreeChange>,
 	over: TaggedChange<SharedTreeChange>,
 	revisionMetadata: RevisionMetadataSource,
-): SharedTreeChange {
-	const schemaChanges = change.change.changes.filter(
-		(c): c is Extract<SharedTreeInnerChange, { type: "schema" }> => c.type === "schema",
-	);
-	const ourDataChanges = change.change.changes.filter(
-		(c): c is Extract<SharedTreeInnerChange, { type: "data" }> => c.type === "data",
-	);
-
-	const overDataChanges = over.change.changes
-		.filter((c): c is Extract<SharedTreeInnerChange, { type: "data" }> => c.type === "data")
-		.map((c) => mapTaggedChange(over, c.innerChange));
-
-	if (overDataChanges.length === 0) {
-		return change.change;
-	}
-
-	const composedOver = modularChangeFamily.compose(overDataChanges);
-
-	const rebasedDataChanges: SharedTreeInnerChange[] = [];
-	for (const innerChange of ourDataChanges) {
-		const rebasedData = modularChangeFamily.rebase(
-			mapTaggedChange(change, innerChange.innerChange),
-			makeAnonChange(composedOver),
-			revisionMetadata,
-		);
-		rebasedDataChanges.push({ type: "data", innerChange: rebasedData });
-	}
-
-	return { changes: [...schemaChanges, ...rebasedDataChanges] };
-}
-
-/**
- * Cases 7/9: Our bundle rebases over their schema-only or bundle change,
- * and their schema is a superset of ours. Drop our schema, rebase our data.
- */
-function rebaseDataOnly(
-	modularChangeFamily: ModularChangeFamily,
-	change: TaggedChange<SharedTreeChange>,
-	over: TaggedChange<SharedTreeChange>,
-	revisionMetadata: RevisionMetadataSource,
+	preserveSchema: boolean,
 ): SharedTreeChange {
 	const ourDataChanges = change.change.changes.filter(
 		(c): c is Extract<SharedTreeInnerChange, { type: "data" }> => c.type === "data",
 	);
+
 	const overDataChanges = over.change.changes
 		.filter((c): c is Extract<SharedTreeInnerChange, { type: "data" }> => c.type === "data")
 		.map((c) => mapTaggedChange(over, c.innerChange));
 
-	if (overDataChanges.length === 0) {
-		return { changes: ourDataChanges };
-	}
+	const rebasedData = rebaseDataInnerChanges(
+		modularChangeFamily,
+		change,
+		ourDataChanges,
+		overDataChanges,
+		revisionMetadata,
+	);
 
-	const composedOver = modularChangeFamily.compose(overDataChanges);
-
-	const rebasedChanges: SharedTreeInnerChange[] = [];
-	for (const innerChange of ourDataChanges) {
-		const rebasedData = modularChangeFamily.rebase(
-			mapTaggedChange(change, innerChange.innerChange),
-			makeAnonChange(composedOver),
-			revisionMetadata,
+	if (preserveSchema) {
+		const schemaChanges = change.change.changes.filter(
+			(c): c is Extract<SharedTreeInnerChange, { type: "schema" }> => c.type === "schema",
 		);
-		rebasedChanges.push({ type: "data", innerChange: rebasedData });
+		return { changes: [...schemaChanges, ...rebasedData] };
 	}
-
-	return { changes: rebasedChanges };
+	return { changes: rebasedData };
 }
 
 /**
- * Case 6a: Data-only change rebases over a bundle with an expansive schema.
- * The schema expansion is safe, so the data is rebased over the data portion of the bundle.
+ * Core rebase: rebases each data inner change over the composed "over" data changes.
+ * Returns the original data changes unchanged if there is nothing to rebase over.
  */
-function rebaseDataOverExpandedSchema(
+function rebaseDataInnerChanges(
 	modularChangeFamily: ModularChangeFamily,
 	change: TaggedChange<SharedTreeChange>,
-	over: TaggedChange<SharedTreeChange>,
+	ourDataChanges: Extract<SharedTreeInnerChange, { type: "data" }>[],
+	overDataChanges: TaggedChange<ModularChangeset>[],
 	revisionMetadata: RevisionMetadataSource,
-): SharedTreeChange {
-	const overDataChanges = over.change.changes
-		.filter((c): c is Extract<SharedTreeInnerChange, { type: "data" }> => c.type === "data")
-		.map((c) => mapTaggedChange(over, c.innerChange));
-
+): SharedTreeInnerChange[] {
 	if (overDataChanges.length === 0) {
-		return change.change;
+		return ourDataChanges;
 	}
 
 	const composedOver = modularChangeFamily.compose(overDataChanges);
-	const rebasedChanges: SharedTreeInnerChange[] = [];
-
-	for (const innerChange of change.change.changes) {
-		assert(innerChange.type === "data", "Expected data-only change in rebasePreservingSchema");
-		const rebasedData = modularChangeFamily.rebase(
+	return ourDataChanges.map((innerChange) => ({
+		type: "data" as const,
+		innerChange: modularChangeFamily.rebase(
 			mapTaggedChange(change, innerChange.innerChange),
 			makeAnonChange(composedOver),
 			revisionMetadata,
-		);
-		rebasedChanges.push({ type: "data", innerChange: rebasedData });
-	}
-
-	return { changes: rebasedChanges };
+		),
+	}));
 }

@@ -664,6 +664,30 @@ describe("SharedTreeChangeFamily", () => {
 		});
 
 		describe("Case 7: Bundle over schema-only", () => {
+			it("preserves data when their schema is the same as ours", () => {
+				// bundleChangeA has new schema = schemaA
+				// schemaOnlyA has new schema = schemaA (same — allowsRepoSuperset(A, A) = true)
+				const schemaOnlyA: SharedTreeChange = {
+					changes: [
+						{
+							type: "schema",
+							innerChange: {
+								schema: { new: schemaA, old: emptySchema },
+								isInverse: false,
+							},
+						},
+					],
+				};
+				const result = sharedTreeFamily.rebase(
+					makeAnonChange(bundleChangeA),
+					makeAnonChange(schemaOnlyA),
+					revisionMetadataSourceFromInfo([]),
+				);
+				// Our schema is dropped (redundant), our data is preserved
+				assert.equal(result.changes.length, 1);
+				assert.equal(result.changes[0].type, "data");
+			});
+
 			it("preserves data when their schema is a superset of ours", () => {
 				// bundleChangeA has new schema = schemaA
 				// schemaOnlyB has new schema = schemaB (superset of A)

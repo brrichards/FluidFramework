@@ -3187,5 +3187,118 @@ describe("SharedTree", () => {
 			assert.equal(view2.root, "hello");
 			validateTreeConsistency(tree1, tree2);
 		});
+
+		it("three clients converge: data edit, schema upgrade, and bundled op", async () => {
+			const provider = new TestTreeProviderLite(
+				3,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2, tree3] = provider.trees;
+
+			// Initialize tree1 with narrow schema
+			const view1 = tree1.viewWith(narrowConfig);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			// Client C (tree3): data edit — sequenced first
+			const view3 = tree3.viewWith(narrowConfig);
+			view3.root = 99;
+
+			// Client B (tree2): upgrade schema directly via upgradeSchema()
+			const view2General = tree2.viewWith(
+				generalizedConfig,
+			) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view2General.upgradeSchema();
+
+			// Client A (tree1): bundled op via upgradeSchemaOnNextEdit
+			view1.dispose();
+			const view1General = tree1.viewWith(
+				generalizedConfig,
+			) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+			view1General.upgradeSchemaOnNextEdit();
+			view1General.root = "hello";
+
+			provider.synchronizeMessages();
+
+			// All three clients should converge
+			assert.equal(view1General.root, view2General.root);
+			validateTreeConsistency(tree1, tree2);
+			validateTreeConsistency(tree2, tree3);
+
+			view1General.dispose();
+			view2General.dispose();
+			view3.dispose();
+		});
+
+		it("upgradeSchema() is a no-op during pending deferred upgrade", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(narrowConfig);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			const view2 = tree2.viewWith(generalizedConfig) as unknown as SchematizingSimpleTreeView<
+				readonly [typeof sf.number, typeof sf.string]
+			>;
+
+			view2.upgradeSchemaOnNextEdit();
+
+			// Schema is already upgraded locally inside the transaction,
+			// so upgradeSchema() should be a no-op (isEquivalent is true)
+			view2.upgradeSchema();
+
+			// Transaction should still be open (upgradeSchema didn't commit or break it)
+			assert.equal(view2.compatibility.canView, true);
+
+			// Now make an edit — should still produce a bundled op
+			view2.root = "hello";
+			provider.synchronizeMessages();
+
+			view1.dispose();
+			const view1General = tree1.viewWith(generalizedConfig);
+			assert.equal(view1General.root, "hello");
+
+			view1General.dispose();
+			view2.dispose();
+		});
+
+		it("initialize() rebase is unaffected by bundle logic", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					jsonValidator: FormatValidatorBasic,
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+			const [tree1, tree2] = provider.trees;
+
+			// Both trees initialize concurrently (before sync)
+			const view1 = tree1.viewWith(narrowConfig);
+			view1.initialize(5);
+
+			const view2 = tree2.viewWith(narrowConfig);
+			view2.initialize(42);
+
+			// Synchronize — one initialize wins, the other gets rebased
+			provider.synchronizeMessages();
+
+			// Both should converge to the same value
+			assert.equal(view1.root, view2.root);
+			validateTreeConsistency(tree1, tree2);
+		});
 	});
 });

@@ -12,6 +12,7 @@ import {
 import { validateUsageError } from "@fluidframework/test-runtime-utils/internal";
 
 import { asAlpha } from "../../api.js";
+import { FluidClientVersion } from "../../codec/index.js";
 import {
 	type Revertible,
 	rootFieldKey,
@@ -47,6 +48,7 @@ import {
 } from "../../simple-tree/index.js";
 // eslint-disable-next-line import-x/no-internal-modules
 import { stringSchema } from "../../simple-tree/leafNodeSchema.js";
+import { configuredSharedTree } from "../../treeFactory.js";
 import { brand } from "../../util/index.js";
 import {
 	TestTreeProviderLite,
@@ -58,6 +60,7 @@ import {
 	mintRevisionTag,
 	testIdCompressor,
 	testRevisionTagCodec,
+	validateTreeConsistency,
 	viewCheckout,
 } from "../utils.js";
 
@@ -1780,6 +1783,399 @@ describe("sharedTreeView", () => {
 				forks: 0,
 				applied: 0,
 			});
+		});
+	});
+});
+
+describe("bundle rebase behavior (integration)", () => {
+	// Schemas must use the same namespace so node types are compatible across views.
+	// Upgrade schemas must include the old type in a union so canUpgrade is true.
+	const sf = new SchemaFactory("bundle-rebase-integration");
+	const ArrayOfString = sf.array(sf.string);
+	const ArrayOfStringNumber = sf.array([sf.string, sf.number]);
+	const ArrayOfStringBoolean = sf.array([sf.string, sf.boolean]);
+	const ArrayOfStringNumberBoolean = sf.array([sf.string, sf.number, sf.boolean]);
+
+	// V1: just ArrayOfString
+	const V1 = ArrayOfString;
+	// V2a: expands to allow number elements — union of old + new array types
+	const V2a = [ArrayOfString, ArrayOfStringNumber];
+	// V2b: expands to allow boolean elements — union of old + new array types (incompatible with V2a's new type)
+	const V2b = [ArrayOfString, ArrayOfStringBoolean];
+	// V2superset: expands to allow number + boolean — superset of both V2a and V2b
+	const V2superset = [
+		ArrayOfString,
+		ArrayOfStringNumber,
+		ArrayOfStringBoolean,
+		ArrayOfStringNumberBoolean,
+	];
+
+	const v1Config = new TreeViewConfiguration({ schema: V1, enableSchemaValidation: true });
+	const v2aConfig = new TreeViewConfiguration({ schema: V2a, enableSchemaValidation: true });
+	const v2bConfig = new TreeViewConfiguration({ schema: V2b, enableSchemaValidation: true });
+	const v2supersetConfig = new TreeViewConfiguration({
+		schema: V2superset,
+		enableSchemaValidation: true,
+	});
+
+	function createProvider(count: number) {
+		return new TestTreeProviderLite(
+			count,
+			configuredSharedTree({
+				minVersionForCollab: FluidClientVersion.v2_90,
+			}).getFactory(),
+		);
+	}
+
+	describe("Case 5: Bundle over data-only", () => {
+		it("R1: bundle rebases over remote data edit — schema preserved, data rebased", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B", "C"]);
+			provider.synchronizeMessages();
+
+			// Client B: data edit (sequenced first)
+			const view2 = tree2.viewWith(v1Config);
+			view2.root.removeAt(0); // Remove "A"
+
+			// Client A: bundle (upgradeSchemaOnNextEdit + edit)
+			view1.dispose();
+			const view1General = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1General.upgradeSchemaOnNextEdit();
+			view1General.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			// Both should converge — A's schema upgrade applied, data rebased
+			validateTreeConsistency(tree1, tree2);
+		});
+
+		it("R2: bundle rebases over multiple remote data edits", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B", "C"]);
+			provider.synchronizeMessages();
+
+			// Client B: multiple data edits (sequenced first)
+			const view2 = tree2.viewWith(v1Config);
+			view2.root.removeAt(0); // Remove "A"
+			view2.root.insertAtEnd("D");
+
+			// Client A: bundle
+			view1.dispose();
+			const view1General = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1General.upgradeSchemaOnNextEdit();
+			view1General.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			validateTreeConsistency(tree1, tree2);
+		});
+	});
+
+	describe("Case 6: Data-only over bundle", () => {
+		it("R3: data-only rebases over remote bundle with expansive schema — data preserved", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B", "C"]);
+			provider.synchronizeMessages();
+
+			// Client B: bundle with expansive schema (V1→V2a), sequenced first
+			const view2 = tree2.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			// Client A: data edit (sequenced second)
+			view1.root.removeAt(0); // Remove "A"
+
+			provider.synchronizeMessages();
+
+			// Both should converge — A's data edit preserved since schema is expansive
+			validateTreeConsistency(tree1, tree2);
+		});
+	});
+
+	describe("Case 7: Bundle over schema-only", () => {
+		it("R5: bundle rebases over remote same-schema upgrade — edit preserved", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B", "C"]);
+			provider.synchronizeMessages();
+
+			// Client B: upgradeSchema to V2a (sequenced first)
+			view1.dispose();
+			const view1v2a = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2a.upgradeSchema();
+
+			// Client A: bundle (V1→V2a + edit)
+			const view2 = tree2.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			// A's schema should be dropped (redundant), A's data edit should be preserved
+			validateTreeConsistency(tree1, tree2);
+			expectSchemaEqual(toUpgradeSchema(V2a), view1v2a.checkout.storedSchema);
+		});
+
+		it("R6: bundle rebases over remote superset schema upgrade — edit preserved", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client B: upgradeSchema to V2superset (sequenced first)
+			view1.dispose();
+			const view1Super = tree1.viewWith(
+				v2supersetConfig,
+			) as unknown as SchematizingSimpleTreeView<typeof V1>;
+			view1Super.upgradeSchema();
+
+			// Client A: bundle (V1→V2a + edit)
+			const view2 = tree2.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			// A's schema dropped, A's data preserved, stored schema is V2superset
+			validateTreeConsistency(tree1, tree2);
+			expectSchemaEqual(toUpgradeSchema(V2superset), view1Super.checkout.storedSchema);
+		});
+
+		it("R7: bundle rebases over remote incompatible schema upgrade — bundle dropped", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client B: upgradeSchema to V2b (sequenced first)
+			view1.dispose();
+			const view1v2b = tree1.viewWith(v2bConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2b.upgradeSchema();
+
+			// Client A: bundle (V1→V2a + edit)
+			const view2 = tree2.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			// A's entire bundle dropped. Stored schema is V2b.
+			validateTreeConsistency(tree1, tree2);
+			expectSchemaEqual(toUpgradeSchema(V2b), view1v2b.checkout.storedSchema);
+		});
+	});
+
+	describe("Case 8: Schema-only over bundle", () => {
+		it("R9: schema-only change rebases over remote bundle — schema dropped", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client B: bundle (sequenced first)
+			const view2 = tree2.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			// Client A: schema-only change (sequenced second)
+			view1.dispose();
+			const view1v2b = tree1.viewWith(v2bConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2b.upgradeSchema();
+
+			provider.synchronizeMessages();
+
+			// A's schema-only change should be dropped
+			validateTreeConsistency(tree1, tree2);
+		});
+	});
+
+	describe("Case 9: Bundle over bundle", () => {
+		it("R10: compatible bundles — later bundle's schema dropped, data preserved", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client B: bundle V1→V2superset + edit (sequenced first)
+			const view2 = tree2.viewWith(v2supersetConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			// Client A: bundle V1→V2a + edit (sequenced second)
+			view1.dispose();
+			const view1v2a = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2a.upgradeSchemaOnNextEdit();
+			view1v2a.root.insertAtEnd("Y");
+
+			provider.synchronizeMessages();
+
+			// V2superset ⊇ V2a, so A's schema dropped, A's data rebased and preserved
+			validateTreeConsistency(tree1, tree2);
+		});
+
+		it("R11: incompatible bundles — later bundle dropped entirely", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client B: bundle V1→V2b + edit (sequenced first)
+			const view2 = tree2.viewWith(v2bConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchemaOnNextEdit();
+			view2.root.insertAtEnd("X");
+
+			// Client A: bundle V1→V2a + edit (sequenced second)
+			view1.dispose();
+			const view1v2a = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2a.upgradeSchemaOnNextEdit();
+			view1v2a.root.insertAtEnd("Y");
+
+			provider.synchronizeMessages();
+
+			// V2b ⊉ V2a, so A's entire bundle dropped
+			validateTreeConsistency(tree1, tree2);
+		});
+	});
+
+	describe("Multi-client scenarios", () => {
+		it("R12: three clients — data edit, schema upgrade, compatible bundle", () => {
+			const provider = createProvider(3);
+			const [tree1, tree2, tree3] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client C (tree3): data edit (seq 1)
+			const view3 = tree3.viewWith(v1Config);
+			view3.root.insertAtEnd("D");
+
+			// Client B (tree2): upgradeSchema to V2superset (seq 2)
+			const view2 = tree2.viewWith(v2supersetConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchema();
+
+			// Client A (tree1): bundle V1→V2a + edit (seq 3)
+			view1.dispose();
+			const view1v2a = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2a.upgradeSchemaOnNextEdit();
+			view1v2a.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			// All three should converge
+			validateTreeConsistency(tree1, tree2);
+			validateTreeConsistency(tree2, tree3);
+		});
+
+		it("R13: three clients — data edit, schema upgrade, incompatible bundle", () => {
+			const provider = createProvider(3);
+			const [tree1, tree2, tree3] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B"]);
+			provider.synchronizeMessages();
+
+			// Client C (tree3): data edit (seq 1)
+			const view3 = tree3.viewWith(v1Config);
+			view3.root.insertAtEnd("D");
+
+			// Client B (tree2): upgradeSchema to V2b (seq 2)
+			const view2 = tree2.viewWith(v2bConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchema();
+
+			// Client A (tree1): bundle V1→V2a + edit (seq 3)
+			view1.dispose();
+			const view1v2a = tree1.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view1v2a.upgradeSchemaOnNextEdit();
+			view1v2a.root.insertAtEnd("X");
+
+			provider.synchronizeMessages();
+
+			// A's bundle dropped (incompatible with V2b), C's data + B's schema survive
+			validateTreeConsistency(tree1, tree2);
+			validateTreeConsistency(tree2, tree3);
+		});
+	});
+
+	describe("Regression: existing non-bundle rebase unchanged", () => {
+		it("R16: data-only over schema-only still dropped", () => {
+			const provider = createProvider(2);
+			const [tree1, tree2] = provider.trees;
+
+			const view1 = tree1.viewWith(v1Config);
+			view1.initialize(["A", "B", "C"]);
+			provider.synchronizeMessages();
+
+			// Client B: upgradeSchema (non-bundle, sequenced first)
+			const view2 = tree2.viewWith(v2aConfig) as unknown as SchematizingSimpleTreeView<
+				typeof V1
+			>;
+			view2.upgradeSchema();
+
+			// Client A: data edit (sequenced second)
+			view1.root.removeAt(0);
+
+			provider.synchronizeMessages();
+
+			// A's data edit dropped (existing behavior: data over schema → dropped)
+			validateTreeConsistency(tree1, tree2);
 		});
 	});
 });

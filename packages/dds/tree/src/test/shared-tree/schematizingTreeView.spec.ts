@@ -1730,5 +1730,206 @@ describe("SchematizingSimpleTreeView", () => {
 
 			view.dispose();
 		});
+
+		it("second edit after upgrade sends a normal data-only op", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+
+			const tree1 = provider.trees[0];
+			const view1 = tree1.viewWith(config);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			const tree2 = provider.trees[1];
+			const view2 = tree2.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			// Spy on submitted ops
+			const submittedOps: unknown[] = [];
+			const tree2Internal = tree2 as unknown as {
+				submitLocalMessage: (content: unknown, localOpMetadata?: unknown) => void;
+			};
+			const originalSubmit = tree2Internal.submitLocalMessage.bind(tree2);
+			tree2Internal.submitLocalMessage = (
+				content: unknown,
+				localOpMetadata?: unknown,
+			): void => {
+				submittedOps.push(content);
+				originalSubmit(content, localOpMetadata);
+			};
+
+			view2.upgradeSchemaOnNextEdit();
+			view2.root = "hello"; // First edit — bundled op
+			assert.equal(submittedOps.length, 1);
+
+			view2.root = 99; // Second edit — normal data-only op
+			assert.equal(submittedOps.length, 2);
+
+			// The second op should NOT contain a schema change
+			const secondOp = submittedOps[1] as { changeset: { schema?: unknown }[] };
+			const hasSchema = secondOp.changeset.some(
+				(entry: { schema?: unknown }) => entry.schema !== undefined,
+			);
+			assert.equal(hasSchema, false, "Second op should be data-only, not bundled");
+
+			view1.dispose();
+			view2.dispose();
+		});
+
+		it("sync transaction inside upgrade window produces bundled op", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// A sync transaction inside the upgrade window should nest and commit
+			const result = view.runTransaction(() => {
+				view.root = "hello";
+			});
+			assert.equal(result.success, true);
+
+			// The outer upgrade transaction should also have committed
+			assert.equal(checkout.transaction.size, 0);
+			assert.equal(view.root, "hello");
+
+			view.dispose();
+		});
+
+		it("reading view.root does not trigger the commit", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// Read the root — this should NOT commit the transaction
+			const rootValue = view.root;
+			assert.equal(rootValue, 5);
+			assert.equal(
+				checkout.transaction.size,
+				1,
+				"Transaction should still be open after read",
+			);
+
+			view.dispose();
+		});
+
+		it("full read-only lifecycle sends zero ops", () => {
+			const provider = new TestTreeProviderLite(
+				2,
+				configuredSharedTree({
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+
+			const tree1 = provider.trees[0];
+			const view1 = tree1.viewWith(config);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			const tree2 = provider.trees[1];
+			const view2 = tree2.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			// Call upgradeSchemaOnNextEdit — read-only client
+			view2.upgradeSchemaOnNextEdit();
+
+			// Read root, access properties — should not trigger ops
+			assert.equal(view2.root, 5);
+
+			// Sync remote edits from tree1
+			view1.root = 42;
+			provider.synchronizeMessages();
+
+			const seqBefore = provider.sequenceNumber;
+
+			// Dispose the read-only view
+			view2.dispose();
+			provider.synchronizeMessages();
+
+			const seqAfter = provider.sequenceNumber;
+			assert.equal(seqAfter, seqBefore, "Read-only client should never send ops");
+
+			// Tree1 should still be on the narrow schema
+			view1.dispose();
+			const view1Check = tree1.viewWith(config);
+			assert.equal(view1Check.root, 42);
+			view1Check.dispose();
+		});
+
+		it("fork() during upgrade window throws UsageError", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// fork() puts the checkout into a broken state via Breakable,
+			// so no dispose() is possible after this point.
+			assert.throws(() => view.fork(), validateUsageError(/pending transaction/));
+		});
+
+		it("merge() during upgrade window throws UsageError", () => {
+			const checkout = checkoutWithInitialTree(config, 5, v2_90Options);
+			const view = new SchematizingSimpleTreeView(
+				checkout,
+				configGeneralized,
+				new MockNodeIdentifierManager(),
+			);
+
+			view.upgradeSchemaOnNextEdit();
+			assert.equal(checkout.transaction.size, 1);
+
+			// merge() puts the checkout into a broken state via Breakable,
+			// so no dispose() is possible after this point.
+			assert.throws(() => view.merge(view), validateUsageError(/pending transaction/));
+		});
+
+		it("after first edit closes transaction, fork() works normally", () => {
+			const provider = new TestTreeProviderLite(
+				1,
+				configuredSharedTree({
+					minVersionForCollab: FluidClientVersion.v2_90,
+				}).getFactory(),
+			);
+
+			const tree1 = provider.trees[0];
+			const view1 = tree1.viewWith(config);
+			view1.initialize(5);
+			provider.synchronizeMessages();
+
+			view1.dispose();
+			const viewGeneral = tree1.viewWith(configGeneralized) as SchematizingSimpleTreeView<
+				readonly [typeof schema.number, typeof schema.string]
+			>;
+
+			viewGeneral.upgradeSchemaOnNextEdit();
+			viewGeneral.root = "hello"; // Commits the upgrade transaction
+
+			// Now fork() should work
+			const forked = viewGeneral.fork();
+			assert.equal(forked.root, "hello");
+			forked.dispose();
+			viewGeneral.dispose();
+		});
 	});
 });

@@ -477,6 +477,47 @@ describe("schemaBasedEncoding", () => {
 			batch: EncodedFieldBatchV2 | EncodedFieldBatchVTextExperimental,
 		): number => batch.shapes.filter((s) => (s as { f?: unknown }).f !== undefined).length;
 
+		const makeTestIdCompressor = (): ReturnType<typeof createIdCompressor> =>
+			createIdCompressor(assertIsSessionId("00000000-0000-4000-b000-000000000000"));
+
+		const decodeRoundTrip = (
+			encoded: EncodedFieldBatchV2 | EncodedFieldBatchVTextExperimental,
+			idCompressor: ReturnType<typeof createIdCompressor>,
+		): ReturnType<typeof decode> => {
+			const idCompressorCore = toIdCompressorWithCore(idCompressor);
+			idCompressorCore.finalizeCreationRange(idCompressorCore.takeNextCreationRange());
+			const decoded = decode(encoded as unknown as Parameters<typeof decode>[0], {
+				idCompressor,
+				originatorId: idCompressor.localSessionId,
+				isSummary: false,
+			});
+			assert.equal(decoded.length, 1, "expected one decoded field per batch entry");
+			return decoded;
+		};
+
+		const makeChunkingIncrementalEncoder = (
+			idCompressor: ReturnType<typeof createIdCompressor>,
+			shouldEncodeIncrementally: IncrementalEncoder["shouldEncodeIncrementally"],
+			onEncode: (encodedSubBatch: EncodedFieldBatchV2) => void,
+		): IncrementalEncoder => {
+			let nextRefId = 1;
+			return {
+				shouldEncodeIncrementally,
+				encodeIncrementalField: (cursor, chunkEncoder) => {
+					const chunk = chunkFieldSingle(cursor, {
+						idCompressor,
+						policy: defaultChunkPolicy,
+					});
+					try {
+						onEncode(chunkEncoder(chunk));
+					} finally {
+						chunk.referenceRemoved();
+					}
+					return [brand<ChunkReferenceId>(nextRefId++)];
+				},
+			};
+		};
+
 		it("round-trips an object with boolean fields and emits f shapes", () => {
 			const sf = new SchemaFactoryAlpha("fmt");
 			class CharacterFormat extends sf.object("CharacterFormat", {
@@ -488,9 +529,7 @@ describe("schemaBasedEncoding", () => {
 				CharacterFormat,
 				restrictiveStoredSchemaGenerationOptions,
 			);
-			const idCompressor = createIdCompressor(
-				assertIsSessionId("00000000-0000-4000-b000-000000000000"),
-			);
+			const idCompressor = makeTestIdCompressor();
 
 			const makeFormat = (bold: boolean, italic: boolean): JsonableTree => ({
 				type: brand<TreeNodeSchemaIdentifier>(CharacterFormat.identifier),
@@ -519,6 +558,7 @@ describe("schemaBasedEncoding", () => {
 				[cursorForJsonableTreeField(tree)],
 				idCompressor,
 				undefined,
+				false,
 				minOccurrencesForSpecialization,
 			);
 
@@ -530,13 +570,7 @@ describe("schemaBasedEncoding", () => {
 			);
 
 			// Round-trip: decode and compare to original tree.
-			const idCompressorCore = toIdCompressorWithCore(idCompressor);
-			idCompressorCore.finalizeCreationRange(idCompressorCore.takeNextCreationRange());
-			const decoded = decode(encoded as unknown as Parameters<typeof decode>[0], {
-				idCompressor,
-				originatorId: idCompressor.localSessionId,
-			});
-			assert.equal(decoded.length, 1, "expected one decoded field per batch entry");
+			const decoded = decodeRoundTrip(encoded, idCompressor);
 			const firstChunk = decoded[0] ?? assert.fail("expected at least one decoded chunk");
 			const resultTree = jsonableTreeFromFieldCursor(firstChunk.cursor());
 			assert.deepEqual(resultTree, tree);
@@ -563,9 +597,7 @@ describe("schemaBasedEncoding", () => {
 			}) {}
 
 			const storedSchema = toStoredSchema(Doc, restrictiveStoredSchemaGenerationOptions);
-			const idCompressor = createIdCompressor(
-				assertIsSessionId("00000000-0000-4000-b000-000000000000"),
-			);
+			const idCompressor = makeTestIdCompressor();
 
 			// Use a lowered threshold of 2 so the test stays compact.
 			//   Outer inline:           2 × (true, false)   ≥ threshold → should specialize.
@@ -581,24 +613,13 @@ describe("schemaBasedEncoding", () => {
 			const doc = new Doc({ inline: new CharacterArray(inline), inc });
 
 			const subEncodings: EncodedFieldBatchV2[] = [];
-			let nextRefId = 1;
-			const mockIncEncoder: IncrementalEncoder = {
-				shouldEncodeIncrementally: incrementalEncodingPolicyForAllowedTypes(
+			const mockIncEncoder = makeChunkingIncrementalEncoder(
+				idCompressor,
+				incrementalEncodingPolicyForAllowedTypes(
 					new TreeViewConfigurationAlpha({ schema: Doc }),
 				),
-				encodeIncrementalField: (cursor, chunkEncoder) => {
-					const chunk = chunkFieldSingle(cursor, {
-						idCompressor,
-						policy: defaultChunkPolicy,
-					});
-					try {
-						subEncodings.push(chunkEncoder(chunk));
-					} finally {
-						chunk.referenceRemoved();
-					}
-					return [brand<ChunkReferenceId>(nextRefId++)];
-				},
-			};
+				(encodedSubBatch) => subEncodings.push(encodedSubBatch),
+			);
 
 			const encoded = schemaCompressedEncodeVTextExperimentalForTests(
 				storedSchema,
@@ -606,6 +627,7 @@ describe("schemaBasedEncoding", () => {
 				[fieldCursorFromInsertable<UnsafeUnknownSchema>(Doc, doc)],
 				idCompressor,
 				mockIncEncoder,
+				false,
 				minOccurrencesForSpecialization,
 			);
 
@@ -645,9 +667,7 @@ describe("schemaBasedEncoding", () => {
 			}) {}
 
 			const storedSchema = toStoredSchema(Doc, restrictiveStoredSchemaGenerationOptions);
-			const idCompressor = createIdCompressor(
-				assertIsSessionId("00000000-0000-4000-b000-000000000000"),
-			);
+			const idCompressor = makeTestIdCompressor();
 
 			// Two CharacterFormat children inside a Map: same boolean tuple, threshold=2 →
 			// the count pass must visit both (correctly evaluating the Map parent's policy
@@ -676,6 +696,7 @@ describe("schemaBasedEncoding", () => {
 				[fieldCursorFromInsertable<UnsafeUnknownSchema>(Doc, doc)],
 				idCompressor,
 				incEncoder,
+				false,
 				minOccurrencesForSpecialization,
 			);
 
@@ -686,13 +707,7 @@ describe("schemaBasedEncoding", () => {
 			);
 
 			// Round-trip to confirm the encoded data is decodable.
-			const idCompressorCore = toIdCompressorWithCore(idCompressor);
-			idCompressorCore.finalizeCreationRange(idCompressorCore.takeNextCreationRange());
-			const decoded = decode(encoded as unknown as Parameters<typeof decode>[0], {
-				idCompressor,
-				originatorId: idCompressor.localSessionId,
-			});
-			assert.equal(decoded.length, 1, "expected one decoded field per batch entry");
+			decodeRoundTrip(encoded, idCompressor);
 		});
 
 		it("SpecializedNodeShapeEncoder asserts on duplicate keys in fieldOverrides", () => {
@@ -737,9 +752,7 @@ describe("schemaBasedEncoding", () => {
 			}) {}
 
 			const storedSchema = toStoredSchema(Format, restrictiveStoredSchemaGenerationOptions);
-			const idCompressor = createIdCompressor(
-				assertIsSessionId("00000000-0000-4000-b000-000000000000"),
-			);
+			const idCompressor = makeTestIdCompressor();
 
 			const tree = Array.from(
 				{ length: 5 },
@@ -762,23 +775,9 @@ describe("schemaBasedEncoding", () => {
 				nodeId === Format.identifier && fieldKey === "bold";
 
 			let chunkEncoderCalls = 0;
-			let nextRefId = 1;
-			const incEncoder: IncrementalEncoder = {
-				shouldEncodeIncrementally: customPolicy,
-				encodeIncrementalField: (cursor, chunkEncoder) => {
-					const chunk = chunkFieldSingle(cursor, {
-						idCompressor,
-						policy: defaultChunkPolicy,
-					});
-					try {
-						chunkEncoder(chunk);
-						chunkEncoderCalls += 1;
-					} finally {
-						chunk.referenceRemoved();
-					}
-					return [brand<ChunkReferenceId>(nextRefId++)];
-				},
-			};
+			const incEncoder = makeChunkingIncrementalEncoder(idCompressor, customPolicy, () => {
+				chunkEncoderCalls += 1;
+			});
 
 			const encoded = schemaCompressedEncodeVTextExperimentalForTests(
 				storedSchema,
@@ -786,6 +785,7 @@ describe("schemaBasedEncoding", () => {
 				[cursorForJsonableTreeField(tree)],
 				idCompressor,
 				incEncoder,
+				false,
 				2 /* minOccurrencesForSpecialization */,
 			);
 

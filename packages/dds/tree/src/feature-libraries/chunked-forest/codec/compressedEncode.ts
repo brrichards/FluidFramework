@@ -68,20 +68,18 @@ export function compressedEncode(
 	fieldBatch: FieldBatch,
 	context: EncoderContext,
 ): EncodedFieldBatchV1OrV2 {
-	const onComplete = context.preEncodeHook?.(fieldBatch, context);
-	try {
-		const batchBuffer: BufferFormat[] = [];
+	context.beginBatch(fieldBatch);
+	const batchBuffer: BufferFormat[] = [];
 
-		// Populate buffer, including shape and identifier references
-		for (const cursor of fieldBatch) {
-			const buffer: BufferFormat = [];
-			anyFieldEncoder.encodeField(cursor, context, buffer);
-			batchBuffer.push(buffer);
-		}
-		return updateShapesAndIdentifiersEncoding(context.version, batchBuffer);
-	} finally {
-		onComplete?.();
+	// Populate buffer, including shape and identifier references
+	for (const cursor of fieldBatch) {
+		const buffer: BufferFormat = [];
+		anyFieldEncoder.encodeField(cursor, context, buffer);
+		batchBuffer.push(buffer);
 	}
+	const result = updateShapesAndIdentifiersEncoding(context.version, batchBuffer);
+	context.endBatch();
+	return result;
 }
 
 export type BufferFormat = BufferFormatGeneric<EncodedChunkShape>;
@@ -635,15 +633,40 @@ export class EncoderContext implements NodeEncodeBuilder, FieldEncodeBuilder {
 		 */
 		public readonly isSummary: boolean,
 		/**
-		 * Optional hook invoked at the start of every {@link compressedEncode} call (including
-		 * the recursive sub-chunk calls made by {@link incrementalFieldEncoder}). Used by
-		 * encoder policies that need per-batch state — e.g. the VText two-pass encoder uses it
-		 * to snapshot/restore per-batch specialization state and to run its counting pass.
+		 * Optional hook invoked by {@link beginBatch} at the start of every {@link compressedEncode}
+		 * call (including the recursive sub-chunk calls made by {@link incrementalFieldEncoder}).
+		 * Lets an encoder policy set up state scoped to a single batch — e.g. the VText encoder
+		 * pushes a fresh per-batch specialization state and runs its counting pass. Paired with
+		 * {@link onEndBatch}.
 		 * @remarks
-		 * See {@link PreEncodeHook}.
+		 * The per-batch state is owned and typed by the policy, not by this generic context;
+		 * keeping it off the encoder instances is what lets recursive sub-chunk encodes get their
+		 * own state with no snapshot/restore.
 		 */
-		public readonly preEncodeHook: PreEncodeHook | undefined = undefined,
+		private readonly onBeginBatch:
+			| ((fieldBatch: FieldBatch, context: EncoderContext) => void)
+			| undefined = undefined,
+		/**
+		 * Optional hook invoked by {@link endBatch} when a {@link compressedEncode} call completes,
+		 * to tear down the per-batch state set up by {@link onBeginBatch}.
+		 */
+		private readonly onEndBatch: (() => void) | undefined = undefined,
 	) {}
+
+	/**
+	 * Invoke the {@link onBeginBatch} hook (if any) at the start of a {@link compressedEncode}
+	 * call. No-op for encoders with no per-batch state (e.g. V1/V2).
+	 */
+	public beginBatch(fieldBatch: FieldBatch): void {
+		this.onBeginBatch?.(fieldBatch, this);
+	}
+
+	/**
+	 * Invoke the {@link onEndBatch} hook (if any) when a {@link compressedEncode} call completes.
+	 */
+	public endBatch(): void {
+		this.onEndBatch?.();
+	}
 
 	public nodeEncoderFromSchema(schemaName: TreeNodeSchemaIdentifier): NodeEncoder {
 		return getOrCreate(this.nodeEncodersFromSchema, schemaName, () =>
@@ -712,23 +735,6 @@ export type NodeEncoderPolicy = (
 	fieldBuilder: FieldEncodeBuilder,
 	schemaName: TreeNodeSchemaIdentifier,
 ) => NodeEncoder;
-
-/**
- * Hook for {@link EncoderContext.preEncodeHook}: invoked at the start of every
- * {@link compressedEncode} call. May optionally return a cleanup callback that is invoked
- * (in a `finally` block) after the encode completes — typically used to restore state
- * snapshotted at hook entry, so recursive sub-chunk encodes do not corrupt the outer
- * batch's state when they unwind.
- *
- * @remarks
- * Contract: cleanup runs only if the hook returns. If the hook itself throws *after*
- * mutating state (e.g. mid-snapshot), it is responsible for restoring that state before
- * rethrowing — `compressedEncode` does not catch hook exceptions.
- */
-export type PreEncodeHook = (
-	fieldBatch: FieldBatch,
-	context: EncoderContext,
-) => (() => void) | undefined;
 
 class LazyFieldEncoder implements FieldEncoder {
 	private encoderLazy: FieldEncoder | undefined;

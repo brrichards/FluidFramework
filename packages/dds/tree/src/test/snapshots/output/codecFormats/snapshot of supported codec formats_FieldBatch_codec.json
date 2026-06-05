@@ -460,24 +460,38 @@
                   "value": {
                     "anyOf": [
                       {
-                        "type": "boolean"
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "minItems": 1,
+                            "maxItems": 1,
+                            "type": "array",
+                            "items": {}
+                          },
+                          {
+                            "const": 0,
+                            "type": "number"
+                          }
+                        ]
                       },
                       {
-                        "minItems": 1,
-                        "maxItems": 1,
-                        "type": "array",
-                        "items": {}
-                      },
-                      {
-                        "const": 0,
-                        "type": "number"
+                        "type": "null"
                       }
                     ]
                   },
                   "extraFields": {
-                    "multipleOf": 1,
-                    "minimum": 0,
-                    "type": "number"
+                    "anyOf": [
+                      {
+                        "multipleOf": 1,
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   }
                 },
                 "required": [

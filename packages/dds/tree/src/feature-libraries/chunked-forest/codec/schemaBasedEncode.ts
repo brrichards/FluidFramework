@@ -23,7 +23,7 @@ import {
 	forEachField,
 	forEachNode,
 } from "../../../core/index.js";
-import { brand, oneFromIterable } from "../../../util/index.js";
+import { brand, getLast, oneFromIterable } from "../../../util/index.js";
 
 import type { IncrementalEncoder } from "./codecs.js";
 import {
@@ -121,6 +121,7 @@ export function schemaCompressedEncodeVTextExperimental(
 	fieldBatch: FieldBatch,
 	idCompressor: IIdCompressor,
 	incrementalEncoder: IncrementalEncoder | undefined,
+	isSummary: boolean,
 ): EncodedFieldBatchVTextExperimental {
 	return schemaCompressedEncodeVTextExperimentalForTests(
 		schema,
@@ -128,6 +129,7 @@ export function schemaCompressedEncodeVTextExperimental(
 		fieldBatch,
 		idCompressor,
 		incrementalEncoder,
+		isSummary,
 		DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION,
 	);
 }
@@ -145,6 +147,7 @@ export function schemaCompressedEncodeVTextExperimentalForTests(
 	fieldBatch: FieldBatch,
 	idCompressor: IIdCompressor,
 	incrementalEncoder: IncrementalEncoder | undefined,
+	isSummary: boolean,
 	minOccurrencesForSpecialization: number,
 ): EncodedFieldBatchVTextExperimental {
 	const context = buildContextVText(
@@ -153,6 +156,7 @@ export function schemaCompressedEncodeVTextExperimentalForTests(
 		idCompressor,
 		incrementalEncoder,
 		brand(FieldBatchFormatVersion.vTextExperimental),
+		isSummary,
 		minOccurrencesForSpecialization,
 	);
 	// `compressedEncode`'s return type is too narrow to express the vTextExperimental version
@@ -184,11 +188,12 @@ function countVTextSpecializationCandidates(
 	fieldBatch: FieldBatch,
 	context: EncoderContext,
 	storedSchema: StoredSchemaCollection,
+	batch: VTextBatchState,
 ): void {
 	const shouldEncodeIncrementally = context.incrementalEncoder?.shouldEncodeIncrementally;
 	for (const cursor of fieldBatch) {
 		forEachNode(cursor, () => {
-			countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally);
+			countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally, batch);
 		});
 	}
 }
@@ -198,6 +203,7 @@ function countNodeAndDescendants(
 	context: EncoderContext,
 	storedSchema: StoredSchemaCollection,
 	shouldEncodeIncrementally: IncrementalEncodingPolicy | undefined,
+	batch: VTextBatchState,
 ): void {
 	const nodeType: TreeNodeSchemaIdentifier = cursor.type;
 	const schema = storedSchema.nodeSchema.get(nodeType);
@@ -209,7 +215,13 @@ function countNodeAndDescendants(
 				return;
 			}
 			forEachNode(cursor, () => {
-				countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally);
+				countNodeAndDescendants(
+					cursor,
+					context,
+					storedSchema,
+					shouldEncodeIncrementally,
+					batch,
+				);
 			});
 		});
 	} else if (schema instanceof MapNodeStoredSchema) {
@@ -220,7 +232,13 @@ function countNodeAndDescendants(
 		}
 		forEachField(cursor, () => {
 			forEachNode(cursor, () => {
-				countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally);
+				countNodeAndDescendants(
+					cursor,
+					context,
+					storedSchema,
+					shouldEncodeIncrementally,
+					batch,
+				);
 			});
 		});
 	}
@@ -234,9 +252,9 @@ function countNodeAndDescendants(
 	// fully counted.
 	const encoder = context.nodeEncoderFromSchema(nodeType);
 	if (encoder instanceof VTextObjectNodeEncoder) {
-		encoder.countNode(cursor);
+		encoder.countNode(cursor, batch);
 	} else if (encoder instanceof VTextLeafNodeEncoder) {
-		encoder.countNode(cursor);
+		encoder.countNode(cursor, batch);
 	}
 }
 
@@ -244,10 +262,12 @@ function countNodeAndDescendants(
  * Like {@link buildContext} but uses the VText-specific node encoder policy that produces
  * {@link SpecializedNodeShapeEncoder} shapes for ObjectNodes with boolean leaf fields.
  * @remarks
- * Wires up a per-batch {@link EncoderContext.preEncodeHook} that resets every
- * {@link VTextObjectNodeEncoder} created in this context and re-runs the counting pass over
- * the current batch — so each `compressedEncode` call (outer or recursive sub-chunk) makes
- * its specialization decisions using only the counts of nodes encoded in *that* batch.
+ * Owns a stack of {@link VTextBatchState}, one entry per in-progress `compressedEncode` call
+ * (outer or recursive incremental sub-chunk). The {@link EncoderContext.beginBatch} hook runs
+ * the counting pass into a fresh state and pushes it; {@link EncoderContext.endBatch} pops it.
+ * The VText encoders read the current (top) batch through a typed accessor, so specialization
+ * decisions stay scoped to the nodes encoded in *that* batch — and the generic
+ * {@link EncoderContext} never has to name (or cast to) the VText state type.
  */
 function buildContextVText(
 	storedSchema: StoredSchemaCollection,
@@ -255,93 +275,54 @@ function buildContextVText(
 	idCompressor: IIdCompressor,
 	incrementalEncoder: IncrementalEncoder | undefined,
 	version: FieldBatchFormatVersion,
+	isSummary: boolean,
 	minOccurrencesForSpecialization: number,
 ): EncoderContext {
-	const vTextEncoders: VTextObjectNodeEncoder[] = [];
-	const vTextLeafEncoders: VTextLeafNodeEncoder[] = [];
+	// Per-batch specialization-count state stack: one entry per in-progress compressedEncode call
+	// (outer or recursive incremental sub-chunk). Owned here, typed as VTextBatchState, so the
+	// generic EncoderContext never has to name or cast to the VText state type.
+	const batchStack: VTextBatchState[] = [];
+	const currentBatch = (): VTextBatchState => {
+		const batch = getLast(batchStack);
+		assert(batch !== undefined, "VText encode requires an active batch state");
+		return batch;
+	};
 	const context: EncoderContext = new EncoderContext(
-		(fieldBuilder: FieldEncodeBuilder, schemaName: TreeNodeSchemaIdentifier) => {
-			const encoder = getNodeEncoderVText(
+		(fieldBuilder: FieldEncodeBuilder, schemaName: TreeNodeSchemaIdentifier) =>
+			getNodeEncoderVText(
 				fieldBuilder,
 				storedSchema,
 				schemaName,
 				incrementalEncoder,
 				context,
 				minOccurrencesForSpecialization,
-			);
-			if (encoder instanceof VTextObjectNodeEncoder) {
-				vTextEncoders.push(encoder);
-			} else if (encoder instanceof VTextLeafNodeEncoder) {
-				vTextLeafEncoders.push(encoder);
-			}
-			return encoder;
-		},
+				currentBatch,
+			),
 		(nodeBuilder: NodeEncodeBuilder, fieldSchema: TreeFieldStoredSchema) =>
 			getFieldEncoder(nodeBuilder, fieldSchema, context, storedSchema),
 		policy.fieldKinds,
 		idCompressor,
 		incrementalEncoder,
 		version,
-		(fieldBatch: FieldBatch, ctx: EncoderContext) => {
-			// Snapshot every existing encoder's batch state, then run the count pass against
-			// fresh state. New encoders created mid-batch (via lazy schema lookup) join
-			// `vTextEncoders` / `vTextLeafEncoders` after this point — they start with empty
-			// state from their constructor, so they don't need a snapshot entry. On unwind,
-			// snapshotted encoders are restored; new-this-batch encoders get their state
-			// cleared so a later batch starts fresh.
-			const objectSnapshots = new Map<VTextObjectNodeEncoder, VTextBatchState>();
-			for (const enc of vTextEncoders) {
-				objectSnapshots.set(enc, enc.swapBatchState());
-			}
-			const leafSnapshots = new Map<VTextLeafNodeEncoder, VTextLeafBatchState>();
-			for (const enc of vTextLeafEncoders) {
-				leafSnapshots.set(enc, enc.swapBatchState());
-			}
-			const restore = (): void => {
-				for (const enc of vTextEncoders) {
-					const snapshot = objectSnapshots.get(enc);
-					if (snapshot === undefined) {
-						enc.swapBatchState();
-					} else {
-						enc.restoreBatchState(snapshot);
-					}
+		isSummary,
+		// onBeginBatch: build this call's specialization-count state, run the multi-pass count loop
+		// into it, and push it as the current batch. Each iteration's `resolveShape` reads counts
+		// populated by the previous iteration, so cohort decisions propagate up the tree one
+		// nesting level per pass; converges in ~2–4 passes for text schemas, bounded by
+		// COUNT_PASS_MAX_ITERATIONS against pathological recursive schemas where thresholds flip.
+		(fieldBatch: FieldBatch, ctx: EncoderContext): void => {
+			const batch = new VTextBatchState();
+			for (let i = 0; i < COUNT_PASS_MAX_ITERATIONS; i++) {
+				countVTextSpecializationCandidates(fieldBatch, ctx, storedSchema, batch);
+				if (!batch.commitIteration()) {
+					break;
 				}
-				for (const enc of vTextLeafEncoders) {
-					const snapshot = leafSnapshots.get(enc);
-					if (snapshot === undefined) {
-						enc.swapBatchState();
-					} else {
-						enc.restoreBatchState(snapshot);
-					}
-				}
-			};
-			// Per the {@link PreEncodeHook} contract, if counting throws after snapshotting
-			// state, we must restore that state before rethrowing — otherwise the next encode
-			// on this context starts with the snapshotted-empty state and the original
-			// counts/specializedEncoders are lost forever.
-			try {
-				// Multi-pass count: each iteration's `resolveShape` reads counts populated by the
-				// previous iteration, so cohort decisions propagate up the tree one nesting level
-				// per pass. Iterates until counts stabilize, bounded by COUNT_PASS_MAX_ITERATIONS.
-				// For text-domain schemas convergence is reached in ~2–4 passes; the bound exists
-				// to defend against pathological cases (e.g. a deeply recursive schema where
-				// thresholds keep flipping).
-				for (let i = 0; i < COUNT_PASS_MAX_ITERATIONS; i++) {
-					countVTextSpecializationCandidates(fieldBatch, ctx, storedSchema);
-					let changed = false;
-					for (const enc of vTextEncoders) {
-						if (enc.commitCountIteration()) changed = true;
-					}
-					for (const enc of vTextLeafEncoders) {
-						if (enc.commitCountIteration()) changed = true;
-					}
-					if (!changed) break;
-				}
-			} catch (error) {
-				restore();
-				throw error;
 			}
-			return restore;
+			batchStack.push(batch);
+		},
+		// onEndBatch: pop this call's state, restoring the parent batch (if any) as current.
+		() => {
+			batchStack.pop();
 		},
 	);
 	return context;
@@ -368,6 +349,7 @@ function getNodeEncoderVText(
 	incrementalEncoder: IncrementalEncoder | undefined,
 	context: EncoderContext,
 	minOccurrencesForSpecialization: number,
+	currentBatch: () => VTextBatchState,
 ): NodeEncoder {
 	const baseEncoder = getNodeEncoder(
 		fieldBuilder,
@@ -385,7 +367,7 @@ function getNodeEncoderVText(
 				baseEncoder instanceof NodeShapeBasedEncoder,
 				"VText leaf encoder policy expects NodeShapeBasedEncoder as base",
 			);
-			return new VTextLeafNodeEncoder(baseEncoder, minOccurrencesForSpecialization);
+			return new VTextLeafNodeEncoder(baseEncoder, minOccurrencesForSpecialization, currentBatch);
 		}
 		return baseEncoder;
 	}
@@ -437,6 +419,7 @@ function getNodeEncoderVText(
 		specializableFields,
 		minOccurrencesForSpecialization,
 		context,
+		currentBatch,
 	);
 }
 
@@ -473,7 +456,7 @@ const COUNT_PASS_MAX_ITERATIONS = 10;
  * Used in a two-pass encode: a counting pass ({@link countNode}) records each tuple's
  * occurrence count, after which the encoding pass ({@link encodeNode}) consults those counts
  * to decide on first sight whether to specialize. Tuples that occur at least
- * {@link MIN_OCCURRENCES_FOR_SPECIALIZATION} times use a specialized shape for *all* their
+ * {@link DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION} times use a specialized shape for *all* their
  * occurrences; rarer tuples encode through the base shape. The parent field uses
  * {@link AnyShape} dispatch so each node can carry its own shape index — paying one extra
  * dispatch token per node but saving one token per field that gets embedded as a constant
@@ -504,14 +487,66 @@ type SpecializableField =
 	| { readonly kind: "subShape"; readonly key: FieldKey };
 
 /**
- * Per-batch state for a {@link VTextObjectNodeEncoder}. Snapshotted/restored by the VText
- * preEncodeHook so recursive sub-chunk encodes (via {@link incrementalFieldEncoder}) make
- * specialization decisions scoped to *their* batch without corrupting the outer batch.
+ * Per-batch specialization state for a single {@link compressedEncode} call, built and pushed
+ * onto the VText-owned batch stack by the {@link EncoderContext.beginBatch} hook wired up in
+ * {@link buildContextVText}. Created fresh per call (including recursive incremental sub-chunk
+ * calls), so two batches never share it.
+ *
+ * State is partitioned per encoder instance: each {@link VTextObjectNodeEncoder} /
+ * {@link VTextLeafNodeEncoder} reads and writes its own {@link CohortState} via {@link forEncoder}.
  */
-interface VTextBatchState {
+class VTextBatchState {
+	private readonly perEncoder: Map<object, CohortState> = new Map();
+
 	/**
-	 * Counts being populated by the current count-pass iteration. After each iteration, copied
-	 * to {@link resolveCounts} so the next iteration's `resolveShape` calls see them.
+	 * The {@link CohortState} for `encoder`, created empty on first access.
+	 */
+	public forEncoder(encoder: object): CohortState {
+		let state = this.perEncoder.get(encoder);
+		if (state === undefined) {
+			state = { counts: new Map(), resolveCounts: new Map(), specializedEncoders: new Map() };
+			this.perEncoder.set(encoder, state);
+		}
+		return state;
+	}
+
+	/**
+	 * Promote each tracked encoder's {@link CohortState.counts} to
+	 * {@link CohortState.resolveCounts} for the next count-pass iteration (or the encode pass),
+	 * and return whether any encoder's counts changed — the multi-pass count loop uses this to
+	 * detect a fixed point.
+	 */
+	public commitIteration(): boolean {
+		let changed = false;
+		for (const state of this.perEncoder.values()) {
+			const previous = state.resolveCounts;
+			const current = state.counts;
+			if (!changed) {
+				if (previous.size === current.size) {
+					for (const [k, v] of current) {
+						if (previous.get(k) !== v) {
+							changed = true;
+							break;
+						}
+					}
+				} else {
+					changed = true;
+				}
+			}
+			state.resolveCounts = new Map(current);
+			state.counts = new Map();
+		}
+		return changed;
+	}
+}
+
+/**
+ * The per-encoder slice of {@link VTextBatchState}.
+ */
+interface CohortState {
+	/**
+	 * Counts being populated by the current count-pass iteration. Promoted to
+	 * {@link resolveCounts} by {@link VTextBatchState.commitIteration} after each iteration.
 	 */
 	counts: Map<string, number>;
 	/**
@@ -520,11 +555,12 @@ interface VTextBatchState {
 	 * count loop converges, at which point the encode pass can read it as the final count map.
 	 */
 	resolveCounts: Map<string, number>;
+	/**
+	 * Specialized shapes decided for this batch, keyed by cohort key. Populated by `resolveShape`
+	 * and reused by reference identity so a parent's cohort key built from a child's resolved
+	 * shape stays stable within the batch.
+	 */
 	specializedEncoders: Map<string, SpecializedNodeShapeEncoder>;
-}
-
-function emptyVTextBatchState(): VTextBatchState {
-	return { counts: new Map(), resolveCounts: new Map(), specializedEncoders: new Map() };
 }
 
 /**
@@ -551,13 +587,13 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 	 */
 	private readonly shapeIds: Map<Shape, number> = new Map();
 	private nextShapeId = 0;
-	private batch: VTextBatchState = emptyVTextBatchState();
 
 	public constructor(
 		private readonly base: NodeShapeBasedEncoder,
 		private readonly specializableFields: readonly SpecializableField[],
 		private readonly minOccurrencesForSpecialization: number,
 		private readonly nodeBuilder: NodeEncodeBuilder,
+		private readonly currentBatch: () => VTextBatchState,
 	) {}
 
 	public get shape(): AnyShape {
@@ -570,28 +606,10 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 	 * {@link SpecializableField} resolution — otherwise their `resolveShape` returns the base
 	 * encoder before their own threshold has been observed, and the parent under-discriminates.
 	 */
-	public countNode(cursor: ITreeCursorSynchronous): void {
-		const key = this.cohortKey(cursor);
-		this.batch.counts.set(key, (this.batch.counts.get(key) ?? 0) + 1);
-	}
-
-	/**
-	 * Replace the active batch state with a fresh empty one and return the previous state.
-	 * Used by the VText preEncodeHook to snapshot/restore around recursive sub-chunk encodes.
-	 * {@link constantNodeEncoders} and {@link shapeIds} are *not* swapped — they are stateless
-	 * caches that are safe (and beneficial) to share across batches.
-	 */
-	public swapBatchState(): VTextBatchState {
-		const previous = this.batch;
-		this.batch = emptyVTextBatchState();
-		return previous;
-	}
-
-	/**
-	 * Restore a batch state previously returned by {@link swapBatchState}.
-	 */
-	public restoreBatchState(state: VTextBatchState): void {
-		this.batch = state;
+	public countNode(cursor: ITreeCursorSynchronous, batch: VTextBatchState): void {
+		const state = batch.forEncoder(this);
+		const key = this.cohortKey(cursor, batch);
+		state.counts.set(key, (state.counts.get(key) ?? 0) + 1);
 	}
 
 	public encodeNode(
@@ -599,60 +617,37 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 		context: EncoderContext,
 		outputBuffer: BufferFormat,
 	): void {
-		const resolved = this.resolveShape(cursor);
-		if (resolved instanceof SpecializedNodeShapeEncoder) {
-			this.batch.specializedEncoders.set(this.cohortKey(cursor), resolved);
-		}
+		const batch = this.currentBatch();
+		const resolved = this.resolveShape(cursor, batch);
 		AnyShape.encodeNode(cursor, context, outputBuffer, resolved);
 	}
 
 	/**
 	 * Returns the {@link NodeEncoder} this encoder will dispatch to for the cursor's current
 	 * node: the cached specialized cohort if the node's tuple has crossed the threshold,
-	 * otherwise the base encoder. Safe to call from a parent encoder — never mutates
-	 * {@link batch.counts}, and caches its newly-created specialized instance in
-	 * {@link batch.specializedEncoders} so subsequent calls (within the same iteration of the
-	 * count loop, and in the encode pass) return the *same* shape reference. That stability
-	 * is load-bearing: a parent encoder uses the resolved shape's identity to build its own
-	 * cohort key via {@link idForShape}, so creating a fresh cohort instance per call would
-	 * give every parent instance a unique key and prevent the parent cohort from firing.
+	 * otherwise the base encoder. Safe to call from a parent encoder — never mutates the
+	 * cohort's counts, and caches its newly-created specialized instance in the cohort's
+	 * `specializedEncoders` so subsequent calls (within the same iteration of the count loop,
+	 * and in the encode pass) return the *same* shape reference. That stability is load-bearing:
+	 * a parent encoder uses the resolved shape's identity to build its own cohort key via
+	 * {@link idForShape}, so creating a fresh cohort instance per call would give every parent
+	 * instance a unique key and prevent the parent cohort from firing.
 	 */
 	public resolveShape(
 		cursor: ITreeCursorSynchronous,
+		batch: VTextBatchState,
 	): NodeShapeBasedEncoder | SpecializedNodeShapeEncoder {
-		const key = this.cohortKey(cursor);
-		const existing = this.batch.specializedEncoders.get(key);
-		if (existing !== undefined) {
-			return existing;
-		}
-		if ((this.batch.resolveCounts.get(key) ?? 0) >= this.minOccurrencesForSpecialization) {
-			const specialized = this.createSpecialized(cursor);
-			this.batch.specializedEncoders.set(key, specialized);
+		const state = batch.forEncoder(this);
+		const key = this.cohortKey(cursor, batch);
+		if ((state.resolveCounts.get(key) ?? 0) >= this.minOccurrencesForSpecialization) {
+			let specialized = state.specializedEncoders.get(key);
+			if (specialized === undefined) {
+				specialized = this.createSpecialized(cursor, batch);
+				state.specializedEncoders.set(key, specialized);
+			}
 			return specialized;
 		}
 		return this.base;
-	}
-
-	/**
-	 * Promote {@link batch.counts} to {@link batch.resolveCounts} for the next count-pass
-	 * iteration (or for the encode pass), and return whether the new counts differ from the
-	 * previous resolveCounts — the multi-pass count loop uses this to detect a fixed point.
-	 */
-	public commitCountIteration(): boolean {
-		const previous = this.batch.resolveCounts;
-		const current = this.batch.counts;
-		let changed = previous.size !== current.size;
-		if (!changed) {
-			for (const [k, v] of current) {
-				if (previous.get(k) !== v) {
-					changed = true;
-					break;
-				}
-			}
-		}
-		this.batch.resolveCounts = new Map(current);
-		this.batch.counts = new Map();
-		return changed;
 	}
 
 	/**
@@ -662,7 +657,7 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 	 * - `leafValue`: the field's leaf value (type-tagged via {@link valueKey}).
 	 * - `subShape`: the per-encoder ID of the resolved child shape (reference identity).
 	 */
-	private cohortKey(cursor: ITreeCursorSynchronous): string {
+	private cohortKey(cursor: ITreeCursorSynchronous, batch: VTextBatchState): string {
 		const parts: string[] = [];
 		for (const field of this.specializableFields) {
 			cursor.enterField(brand(field.key));
@@ -675,7 +670,7 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 				const childShape =
 					childEncoder instanceof VTextLeafNodeEncoder ||
 					childEncoder instanceof VTextObjectNodeEncoder
-						? childEncoder.resolveShape(cursor)
+						? childEncoder.resolveShape(cursor, batch)
 						: childEncoder.shape;
 				parts.push(`S:${this.idForShape(childShape)}`);
 			}
@@ -694,7 +689,10 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 		return id;
 	}
 
-	private createSpecialized(cursor: ITreeCursorSynchronous): SpecializedNodeShapeEncoder {
+	private createSpecialized(
+		cursor: ITreeCursorSynchronous,
+		batch: VTextBatchState,
+	): SpecializedNodeShapeEncoder {
 		const overrides: KeyedFieldEncoder[] = [];
 		for (const field of this.specializableFields) {
 			cursor.enterField(brand(field.key));
@@ -714,7 +712,7 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 				const resolvedChild =
 					childEncoder instanceof VTextLeafNodeEncoder ||
 					childEncoder instanceof VTextObjectNodeEncoder
-						? childEncoder.resolveShape(cursor)
+						? childEncoder.resolveShape(cursor, batch)
 						: childEncoder;
 				overrides.push({
 					key: field.key,
@@ -729,24 +727,9 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 }
 
 /**
- * Per-batch state for a {@link VTextLeafNodeEncoder}. Keyed on the encoded leaf value.
- * Snapshotted/restored by the VText preEncodeHook for the same reasons as
- * {@link VTextBatchState}.
- */
-interface VTextLeafBatchState {
-	counts: Map<string, number>;
-	resolveCounts: Map<string, number>;
-	specializedEncoders: Map<string, SpecializedNodeShapeEncoder>;
-}
-
-function emptyVTextLeafBatchState(): VTextLeafBatchState {
-	return { counts: new Map(), resolveCounts: new Map(), specializedEncoders: new Map() };
-}
-
-/**
  * Encodes a string- or number-valued leaf node, producing a {@link SpecializedNodeShapeEncoder}
  * that constant-folds the leaf's value when that value occurs at least
- * {@link MIN_OCCURRENCES_FOR_SPECIALIZATION} times in the batch.
+ * {@link DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION} times in the batch.
  *
  * Counting and dispatch mirror {@link VTextObjectNodeEncoder}: pass 1 records each value's
  * occurrence count, and pass 2 promotes each cohort that crosses the threshold to its own
@@ -761,11 +744,11 @@ function emptyVTextLeafBatchState(): VTextLeafBatchState {
  */
 class VTextLeafNodeEncoder implements NodeEncoder {
 	private readonly constantNodeEncoders: Map<string, SpecializedNodeShapeEncoder> = new Map();
-	private batch: VTextLeafBatchState = emptyVTextLeafBatchState();
 
 	public constructor(
 		private readonly base: NodeShapeBasedEncoder,
 		private readonly minOccurrencesForSpecialization: number,
+		private readonly currentBatch: () => VTextBatchState,
 	) {}
 
 	public get shape(): AnyShape {
@@ -775,19 +758,10 @@ class VTextLeafNodeEncoder implements NodeEncoder {
 	/**
 	 * Counting-pass entry point. Records this leaf's value occurrence without producing output.
 	 */
-	public countNode(cursor: ITreeCursorSynchronous): void {
+	public countNode(cursor: ITreeCursorSynchronous, batch: VTextBatchState): void {
+		const state = batch.forEncoder(this);
 		const key = valueKey(cursor.value);
-		this.batch.counts.set(key, (this.batch.counts.get(key) ?? 0) + 1);
-	}
-
-	public swapBatchState(): VTextLeafBatchState {
-		const previous = this.batch;
-		this.batch = emptyVTextLeafBatchState();
-		return previous;
-	}
-
-	public restoreBatchState(state: VTextLeafBatchState): void {
-		this.batch = state;
+		state.counts.set(key, (state.counts.get(key) ?? 0) + 1);
 	}
 
 	public encodeNode(
@@ -795,10 +769,8 @@ class VTextLeafNodeEncoder implements NodeEncoder {
 		context: EncoderContext,
 		outputBuffer: BufferFormat,
 	): void {
-		const resolved = this.resolveShape(cursor);
-		if (resolved instanceof SpecializedNodeShapeEncoder) {
-			this.batch.specializedEncoders.set(valueKey(cursor.value), resolved);
-		}
+		const batch = this.currentBatch();
+		const resolved = this.resolveShape(cursor, batch);
 		AnyShape.encodeNode(cursor, context, outputBuffer, resolved);
 	}
 
@@ -806,43 +778,23 @@ class VTextLeafNodeEncoder implements NodeEncoder {
 	 * Returns the {@link NodeEncoder} this encoder will dispatch to for the cursor's current
 	 * value: the cached specialized cohort if the value's count has crossed the threshold,
 	 * otherwise the base encoder. Safe to call from a parent encoder's count pass — it never
-	 * mutates {@link batch.counts}, and the cached specialized instance is reused at encode time.
+	 * mutates the cohort's counts, and the cached specialized instance is reused at encode time.
 	 */
 	public resolveShape(
 		cursor: ITreeCursorSynchronous,
+		batch: VTextBatchState,
 	): NodeShapeBasedEncoder | SpecializedNodeShapeEncoder {
 		const value = cursor.value;
 		const key = valueKey(value);
-		const existing = this.batch.specializedEncoders.get(key);
-		if (existing !== undefined) {
-			return existing;
-		}
-		if ((this.batch.resolveCounts.get(key) ?? 0) >= this.minOccurrencesForSpecialization) {
+		const state = batch.forEncoder(this);
+		// Consult the threshold every time, mirroring VTextObjectNodeEncoder.resolveShape. A
+		// leaf value's count is stable across count-pass iterations, so it cannot currently
+		// flip below the threshold once above it — but gating here keeps the two encoders
+		// consistent and robust if leaf counts ever become convergence-dependent.
+		if ((state.resolveCounts.get(key) ?? 0) >= this.minOccurrencesForSpecialization) {
 			return this.getOrCreateSpecialized(key, value);
 		}
 		return this.base;
-	}
-
-	/**
-	 * Promote {@link batch.counts} to {@link batch.resolveCounts} for the next count-pass
-	 * iteration (or the encode pass), and return whether the new counts differ from the
-	 * previous resolveCounts — the multi-pass count loop uses this to detect a fixed point.
-	 */
-	public commitCountIteration(): boolean {
-		const previous = this.batch.resolveCounts;
-		const current = this.batch.counts;
-		let changed = previous.size !== current.size;
-		if (!changed) {
-			for (const [k, v] of current) {
-				if (previous.get(k) !== v) {
-					changed = true;
-					break;
-				}
-			}
-		}
-		this.batch.resolveCounts = new Map(current);
-		this.batch.counts = new Map();
-		return changed;
 	}
 
 	private getOrCreateSpecialized(key: string, value: Value): SpecializedNodeShapeEncoder {

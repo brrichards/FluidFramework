@@ -55,8 +55,6 @@ import {
 } from "../../../../feature-libraries/chunked-forest/codec/compressedEncode.js";
 import {
 	type EncodedChunkShapeV1,
-	EncodedFieldBatchV1,
-	EncodedFieldBatchV2,
 	type EncodedFieldBatchAnyVersion,
 	type EncodedValueShape,
 	FieldBatchFormatVersion,
@@ -146,7 +144,9 @@ const fieldBatchVersion = brand<FieldBatchFormatVersion>(FieldBatchFormatVersion
 describe("compressedEncode", () => {
 	// This is a good smoke test for compressedEncode,
 	// but also provides good coverage of anyNodeEncoder, anyFieldEncoder as well as AnyShape which they are built on.
-	for (const version of fieldBatchCodecBuilder.registry.map((entry) => entry.formatVersion)) {
+	for (const entry of fieldBatchCodecBuilder.registry) {
+		const version = entry.formatVersion;
+		const { schema } = entry.codec({ jsonValidator: FormatValidatorBasic });
 		describe(`schemaless test trees FieldBatchFormatVersion V${version}`, () => {
 			useSnapshotDirectory(`chunked-forest-compressed-schemaless/V${version}`);
 			for (const [name, jsonable] of schemalessTestTrees) {
@@ -168,7 +168,7 @@ describe("compressedEncode", () => {
 					const codec = makeFieldBatchCodec(
 						{ jsonValidator: FormatValidatorBasic },
 						context,
-						[EncodedFieldBatchV1, EncodedFieldBatchV2][version - 1],
+						schema,
 						version,
 					);
 					const { encode, decode: decodeContext } = makeTestFieldBatchContexts({

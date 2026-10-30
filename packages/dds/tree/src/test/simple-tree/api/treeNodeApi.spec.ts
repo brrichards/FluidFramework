@@ -4101,6 +4101,83 @@ describe("treeNodeApi", () => {
 						fields: {},
 					},
 				);
+
+				assert.deepEqual(
+					TreeAlpha.exportVerbose(node, { keys: KeyEncodingOptions.unknownStoredKeys }),
+					{
+						type: PointUnknown.identifier,
+						fields: { x: 1 },
+					},
+				);
+			});
+
+			it("unknownStoredKeys includes only unknown fields at each depth", () => {
+				// The newer schema adds `nickname` and `address` to `Person`. `Address` is a new type.
+				const sfNew = new SchemaFactoryAlpha("unknownStoredKeys");
+				class TagsNew extends sfNew.array("Tags", sfNew.string) {}
+				class PersonNew extends sfNew.objectRecursive("Person", {
+					name: sfNew.string,
+					tags: sfNew.optional(TagsNew),
+					nickname: sfNew.optional(sfNew.string),
+					address: sfNew.optionalRecursive([() => AddressNew]),
+				}) {}
+				class AddressNew extends sfNew.object("Address", {
+					street: sfNew.string,
+					labels: sfNew.optional(TagsNew),
+					owner: sfNew.optional(PersonNew),
+				}) {}
+
+				const sfOld = new SchemaFactoryAlpha("unknownStoredKeys");
+				class TagsOld extends sfOld.array("Tags", sfOld.string) {}
+				class PersonOld extends sfOld.objectAlpha(
+					"Person",
+					{ name: sfOld.string, tags: sfOld.optional(TagsOld) },
+					{ allowUnknownOptionalFields: true },
+				) {}
+
+				// Content in the newer schema, viewed with the older schema.
+				const content = new PersonNew({
+					name: "Alice",
+					tags: new TagsNew(["a"]),
+					address: new AddressNew({
+						street: "Main",
+						labels: new TagsNew(["l"]),
+						owner: new PersonNew({ name: "Bob", nickname: "B", tags: new TagsNew(["b"]) }),
+					}),
+				});
+				const viewOld = testDocumentIndependentView({
+					ambiguous: false,
+					schema: PersonOld,
+					schemaData: toInitialSchema(PersonNew),
+					treeFactory: () =>
+						jsonableTreeFromFieldCursor(fieldCursorFromInsertable(PersonNew, content)),
+				});
+				assert(isTreeNode(viewOld.root));
+
+				// `Person` and `Tags` are in the view schema, so they keep only their unknown fields.
+				// `Address` is not in the view schema, so it keeps all of its fields.
+				assert.deepEqual(
+					TreeAlpha.exportVerbose(viewOld.root, {
+						keys: KeyEncodingOptions.unknownStoredKeys,
+					}),
+					{
+						type: "unknownStoredKeys.Person",
+						fields: {
+							address: {
+								type: "unknownStoredKeys.Address",
+								fields: {
+									street: "Main",
+									labels: { type: "unknownStoredKeys.Tags", fields: [] },
+									owner: { type: "unknownStoredKeys.Person", fields: { nickname: "B" } },
+								},
+							},
+						},
+					},
+				);
+				assert.deepEqual(
+					TreeBeta.exportConcise(viewOld.root, { keys: KeyEncodingOptions.unknownStoredKeys }),
+					{ address: { street: "Main", labels: [], owner: { nickname: "B" } } },
+				);
 			});
 
 			describe("test-documents", () => {
@@ -4208,6 +4285,22 @@ describe("treeNodeApi", () => {
 										assert(imported !== undefined);
 										const reexported = TreeAlpha.exportVerbose(imported);
 										assert.deepEqual(exported, reexported);
+									}
+
+									// Only unknown stored keys
+									{
+										const options = { keys: KeyEncodingOptions.unknownStoredKeys };
+										const exported = TreeAlpha.exportVerbose(root, options);
+										// Hydrated and unhydrated nodes export the same unknown content.
+										const hydratedRoot = view.root;
+										assert(hydratedRoot !== undefined);
+										assert.deepEqual(exported, TreeAlpha.exportVerbose(hydratedRoot, options));
+										if (!testCase.hasUnknownOptionalFields && isTreeNode(root)) {
+											assert.deepEqual(
+												Object.keys((exported as { fields: object }).fields),
+												[],
+											);
+										}
 									}
 								}
 							});

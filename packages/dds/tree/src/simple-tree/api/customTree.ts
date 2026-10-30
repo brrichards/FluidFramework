@@ -86,6 +86,14 @@ export enum KeyEncodingOptions {
 	 * For import, any unexpected fields are errors, regardless of {@link ObjectSchemaOptions.allowUnknownOptionalFields}.
 	 */
 	knownStoredKeys = "knownStoredKeys",
+	/**
+	 * Use stored keys, and include only {@link ObjectSchemaOptions.allowUnknownOptionalFields | unknown optional fields}.
+	 * @remarks
+	 * Currently only supported for export.
+	 * This applies to each node: a node of a type that is in the view schema keeps only its unknown optional fields.
+	 * A node of a type that is not in the view schema keeps all of its fields.
+	 */
+	unknownStoredKeys = "unknownStoredKeys",
 }
 
 /**
@@ -171,7 +179,7 @@ export function customFromCursor<TChild>(
 					const storedKey = reader.getFieldKey();
 					const key = getKeyFromOptions(options.keys, type, storedKey, schema);
 					if (key === undefined) {
-						// Skip unknown optional fields when using property keys or only known stored keys.
+						// Skip the fields that `options` excludes.
 						return;
 					}
 
@@ -181,6 +189,10 @@ export function customFromCursor<TChild>(
 				});
 				return fields;
 			} else {
+				if (options.keys === KeyEncodingOptions.unknownStoredKeys && schema.has(type)) {
+					// An array node of a type that is in the view schema has no unknown fields.
+					return [];
+				}
 				const fields = inCursorField(reader, EmptyKey, () =>
 					mapCursorField(reader, () => childHandler(reader, options, storedSchema, schema)),
 				);
@@ -194,14 +206,14 @@ export function customFromCursor<TChild>(
  * Returns the key if one should be used, and undefined if the field should be omitted/skipped.
  *
  * @param schema - Collection of known view schema.
- * If `options` is not `KeyEncodingOptions.allStoredKeys`, this must provide the schema for the `type`.
+ * If `options` is not `KeyEncodingOptions.allStoredKeys` or `KeyEncodingOptions.unknownStoredKeys`, this must provide the schema for the `type`.
  * Note that if using this to perform a recursive walk, and `schema` has all view schema reachable from the starting type,
  * then it should be safe to use the same schema map on every invocation since types missing from it will only be
  * encountered after traversing unknown optional fields which for which this will return undefined.
  *
  * @remarks
  * Asserts that if encountering an unknown optional field, the schema allows them.
- * This is not robustly validated in all cases: when in allStoredKeys, it is not checked
+ * This is not robustly validated in all cases: when in allStoredKeys or unknownStoredKeys, it is not checked
  * (since the view schema might not even be available).
  */
 function getKeyFromOptions(
@@ -216,6 +228,18 @@ function getKeyFromOptions(
 			// it must not depend on there being a view schema.
 			// Fortunately, its possible to implement this case without one.
 			return storedKey;
+		}
+		case KeyEncodingOptions.unknownStoredKeys: {
+			const viewSchema = schema.get(type);
+			if (viewSchema === undefined) {
+				// All fields of a node type that is not in the view schema are unknown.
+				return storedKey;
+			}
+			if (isObjectNodeSchema(viewSchema)) {
+				return viewSchema.storedKeyToPropertyKey.has(storedKey) ? undefined : storedKey;
+			}
+			// Other node kinds in the view schema have no unknown fields.
+			return undefined;
 		}
 		case KeyEncodingOptions.usePropertyKeys:
 		case KeyEncodingOptions.knownStoredKeys: {
